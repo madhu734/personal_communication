@@ -21,8 +21,8 @@
    ```
    app/google-services.json
    ```
-4. Keep all server-side credentials (`mandy-chat-firebase-adminsdk-*.json`, `LIVEKIT_API_SECRET`, `SMTP_PASSWORD`, `PB_SETTINGS_KEY`) on the server only.
-5. Note: When `app/google-services.json` is omitted during local/emulator UI development, `googleServices { missingGoogleServicesStrategy = WARN }` allows `assembleDebug` to succeed and the in-app **Diagnostics & Call/Notification Test Triggers** let you test all call and notification flows immediately.
+4. Keep all server-side credentials (the Firebase Admin service-account key, `LIVEKIT_API_SECRET`, `SMTP_PASSWORD`, `PB_SETTINGS_KEY`) on the server only — never commit or bundle them into the Android repository.
+5. Note: `app/google-services.json` for project `mandy-chat` (`me.tmadhu.mandychat`) is already included in the repository. When omitted in stripped builds, `googleServices { missingGoogleServicesStrategy = WARN }` keeps `assembleDebug` buildable.
 
 ---
 
