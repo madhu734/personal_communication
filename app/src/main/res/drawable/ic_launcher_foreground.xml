@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Chat bubble with integrated handset/video emblem inside 66dp safe zone -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M30,32 C30,27.58 33.58,24 38,24 L70,24 C74.42,24 78,27.58 78,32 L78,58 C78,62.42 74.42,66 70,66 L48,66 L34,78 L34,66 L38,66 C33.58,66 30,62.42 30,58 Z" />
+    <path
+        android:fillColor="#0B241B"
+        android:pathData="M42,38 L58,38 C60.21,38 62,39.79 62,42 L62,48 C62,50.21 60.21,52 58,52 L42,52 C39.79,52 38,50.21 38,48 L38,42 C38,39.79 39.79,38 42,38 Z M64,43 L71,38 L71,52 L64,47 Z" />
+</vector>

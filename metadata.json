@@ -1,0 +1,11 @@
+{
+  "name": "Apun Ka Communication",
+  "description": "Private 1-to-1 messaging, protected media sharing, and WhatsApp-style audio/video calling powered by PocketBase and LiveKit.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

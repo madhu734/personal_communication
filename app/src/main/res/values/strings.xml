@@ -1,0 +1,13 @@
+<resources>
+    <string name="app_name">Apun Ka Communication</string>
+    <string name="notif_channel_calls_name">Incoming &amp; Active Calls</string>
+    <string name="notif_channel_calls_desc">High-priority ringing and ongoing call controls</string>
+    <string name="notif_channel_messages_name">Direct Messages</string>
+    <string name="notif_channel_messages_desc">New message notifications with direct reply and mute actions</string>
+    <string name="action_reply">Reply</string>
+    <string name="action_retry_reply">Retry Reply</string>
+    <string name="action_mute">Mute</string>
+    <string name="action_answer">Answer</string>
+    <string name="action_decline">Decline</string>
+    <string name="action_hang_up">Hang Up</string>
+</resources>
