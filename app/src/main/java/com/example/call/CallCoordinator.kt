@@ -254,6 +254,23 @@ class CallCoordinator(
             if (preloadedRecord == null && sessionStore.getAuthToken().isNotBlank()) {
                 try {
                     val authoritative = apiClient.fetchCallRecord(callId)
+                    if (peerLookupProvider == null && fallbackPeer == null) {
+                        try {
+                            val inbox = apiClient.fetchInbox()
+                            val matchedPeer = inbox.chats.firstOrNull {
+                                it.id == authoritative.conversation ||
+                                    it.peer.id == authoritative.caller
+                            }?.peer
+                            if (matchedPeer != null) {
+                                callMutex.withLock {
+                                    if (_uiState.value.callId == callId) {
+                                        _uiState.update { it.copy(peer = matchedPeer) }
+                                    }
+                                }
+                            }
+                        } catch (_: Exception) {
+                        }
+                    }
                     onCallRecordUpdated(authoritative)
                 } catch (e: ApiException) {
                     if (e.statusCode == 404 || e.statusCode == 401 || e.statusCode == 403) {
@@ -450,6 +467,50 @@ class CallCoordinator(
                 terminateCallInternal(callId, "Call ended (${e.statusCode})")
             } catch (e: Exception) {
                 terminateCallInternal(callId, e.message ?: "Failed to answer call")
+            }
+        }
+    }
+
+    /**
+     * Recovers and answers an incoming call from notification action if the process was restarted.
+     */
+    fun restoreAndAnswerCallFromNotification(callId: String) {
+        if (callId.isBlank() || sessionStore.getAuthToken().isBlank()) return
+        scope.launch {
+            try {
+                val record = apiClient.fetchCallRecord(callId)
+                if (record.status.isTerminal) {
+                    SystemNotificationAndFcmManager.cancelCallNotification(appContext)
+                    CallForegroundService.stop(appContext)
+                    return@launch
+                }
+                val peer = try {
+                    apiClient.fetchInbox().chats.firstOrNull {
+                        it.id == record.conversation || it.peer.id == record.caller
+                    }?.peer
+                } catch (_: Exception) {
+                    null
+                } ?: PeerSummary(id = record.caller, name = "Contact")
+                val endpoints = withContext(Dispatchers.IO) { querySystemAudioEndpoints() }
+                callMutex.withLock {
+                    _uiState.value = ActiveCallUiState(
+                        callId = record.id,
+                        conversationId = record.conversation,
+                        peer = peer,
+                        kind = record.kind,
+                        isOutgoing = false,
+                        phase = CallPhase.INCOMING_RINGING,
+                        isMicEnabled = true,
+                        isCameraEnabled = false,
+                        availableEndpoints = endpoints,
+                        statusBannerText = "Connecting...",
+                        roomName = record.room
+                    )
+                }
+                answerIncomingCall(withVideo = false)
+            } catch (_: Exception) {
+                SystemNotificationAndFcmManager.cancelCallNotification(appContext)
+                CallForegroundService.stop(appContext)
             }
         }
     }

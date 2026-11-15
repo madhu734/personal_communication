@@ -90,8 +90,8 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     val sessionStore = SessionAndMuteStore(application)
     val apiClient = PocketBaseApiClient(sessionStore)
     val realtimeClient = PocketBaseRealtimeClient(sessionStore)
-    val callCoordinator = CallCoordinator(
-        appContext = application.applicationContext,
+    val callCoordinator = SystemNotificationAndFcmManager.getOrCreateCallCoordinator(
+        context = application.applicationContext,
         sessionStore = sessionStore,
         apiClient = apiClient
     )
@@ -127,7 +127,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     init {
         SystemNotificationAndFcmManager.ensureChannelsCreated(application)
-        SystemNotificationAndFcmManager.activeCallCoordinator = callCoordinator
         callCoordinator.peerLookupProvider = { conversationId, peerId ->
             _uiState.value.chats.firstOrNull { it.id == conversationId || it.peer.id == peerId }?.peer
                 ?: PeerSummary(id = peerId, name = "Contact")
@@ -785,16 +784,29 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             if (pending.isNotBlank()) {
                 registerFcmTokenWithBackend(pending)
             }
-            try {
-                FirebaseMessaging.getInstance().token.addOnSuccessListener { token ->
+            fetchAndRegisterFirebaseToken(attempt = 0)
+        }
+    }
+
+    private fun fetchAndRegisterFirebaseToken(attempt: Int) {
+        try {
+            FirebaseMessaging.getInstance().token
+                .addOnSuccessListener { token ->
                     if (!token.isNullOrBlank()) {
                         viewModelScope.launch(Dispatchers.IO) {
                             registerFcmTokenWithBackend(token)
                         }
                     }
                 }
-            } catch (_: Exception) {
-            }
+                .addOnFailureListener {
+                    if (attempt < 2) {
+                        viewModelScope.launch(Dispatchers.IO) {
+                            delay(2_500L)
+                            fetchAndRegisterFirebaseToken(attempt + 1)
+                        }
+                    }
+                }
+        } catch (_: Exception) {
         }
     }
 

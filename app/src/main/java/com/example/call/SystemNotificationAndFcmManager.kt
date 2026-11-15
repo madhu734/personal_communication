@@ -1,5 +1,6 @@
 package com.example.call
 
+import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -8,10 +9,12 @@ import android.app.Service
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
+import android.os.PowerManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.Arrangement
@@ -35,6 +38,7 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.app.Person
 import androidx.core.app.RemoteInput
+import androidx.core.content.ContextCompat
 import com.example.MainActivity
 import com.example.R
 import com.example.model.ActiveCallUiState
@@ -85,6 +89,22 @@ object SystemNotificationAndFcmManager {
 
     @Volatile
     var activeCallCoordinator: CallCoordinator? = null
+
+    fun getOrCreateCallCoordinator(
+        context: Context,
+        sessionStore: SessionAndMuteStore = SessionAndMuteStore(context.applicationContext),
+        apiClient: PocketBaseApiClient = PocketBaseApiClient(sessionStore)
+    ): CallCoordinator {
+        val existing = activeCallCoordinator
+        if (existing != null) return existing
+        return synchronized(this) {
+            activeCallCoordinator ?: CallCoordinator(
+                appContext = context.applicationContext,
+                sessionStore = sessionStore,
+                apiClient = apiClient
+            ).also { activeCallCoordinator = it }
+        }
+    }
 
     @Volatile
     var onDirectReplySentCallback: ((String) -> Unit)? = null
@@ -217,9 +237,17 @@ object SystemNotificationAndFcmManager {
             state = state,
             isIncoming = isIncoming
         )
-        try {
-            NotificationManagerCompat.from(context).notify(CALL_NOTIFICATION_ID, notification)
-        } catch (_: Throwable) {
+        val hasPostNotifPerm = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+            ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.POST_NOTIFICATIONS
+            ) == PackageManager.PERMISSION_GRANTED
+        if (hasPostNotifPerm) {
+            try {
+                NotificationManagerCompat.from(context).notify(CALL_NOTIFICATION_ID, notification)
+            } catch (_: SecurityException) {
+            } catch (_: Throwable) {
+            }
         }
         return notification
     }
@@ -467,18 +495,21 @@ class ApunKaMessagingService : FirebaseMessagingService() {
 
         when (event) {
             "incoming_call" -> {
-                val coordinator = SystemNotificationAndFcmManager.activeCallCoordinator
-                if (coordinator != null) {
-                    coordinator.onIncomingCallSignal(callId = id, expiresAtRaw = expiresAt)
-                } else {
-                    val tempCoordinator = CallCoordinator(
-                        appContext = applicationContext,
-                        sessionStore = store,
-                        apiClient = PocketBaseApiClient(store)
+                try {
+                    val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
+                    val wakeLock = pm?.newWakeLock(
+                        PowerManager.PARTIAL_WAKE_LOCK,
+                        "me.tmadhu.mandychat:IncomingCallWake"
                     )
-                    SystemNotificationAndFcmManager.activeCallCoordinator = tempCoordinator
-                    tempCoordinator.onIncomingCallSignal(callId = id, expiresAtRaw = expiresAt)
+                    wakeLock?.acquire(10_000L)
+                } catch (_: Exception) {
                 }
+                val coordinator = SystemNotificationAndFcmManager.getOrCreateCallCoordinator(
+                    context = applicationContext,
+                    sessionStore = store,
+                    apiClient = PocketBaseApiClient(store)
+                )
+                coordinator.onIncomingCallSignal(callId = id, expiresAtRaw = expiresAt)
             }
 
             "new_message" -> {
@@ -555,14 +586,60 @@ class ApunKaMessagingService : FirebaseMessagingService() {
 class NotificationActionReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         val action = intent.action ?: return
+        val appContext = context.applicationContext
+        val callIdFromIntent = intent.getStringExtra(SystemNotificationAndFcmManager.EXTRA_CALL_ID).orEmpty()
+
         when (action) {
             SystemNotificationAndFcmManager.ACTION_CALL_ANSWER -> {
-                SystemNotificationAndFcmManager.activeCallCoordinator?.answerIncomingCall(withVideo = false)
+                val store = SessionAndMuteStore(appContext)
+                val api = PocketBaseApiClient(store)
+                val coordinator = SystemNotificationAndFcmManager.getOrCreateCallCoordinator(appContext, store, api)
+                if (coordinator.uiState.value.callId.isNotBlank()) {
+                    coordinator.answerIncomingCall(withVideo = false)
+                } else if (callIdFromIntent.isNotBlank()) {
+                    coordinator.restoreAndAnswerCallFromNotification(callIdFromIntent)
+                }
+                // Bring MainActivity to foreground so the user sees the active call screen and mic permission dialog
+                try {
+                    val launchIntent = Intent(appContext, MainActivity::class.java).apply {
+                        flags = Intent.FLAG_ACTIVITY_NEW_TASK or
+                            Intent.FLAG_ACTIVITY_SINGLE_TOP or
+                            Intent.FLAG_ACTIVITY_CLEAR_TOP
+                        if (callIdFromIntent.isNotBlank()) {
+                            putExtra(SystemNotificationAndFcmManager.EXTRA_CALL_ID, callIdFromIntent)
+                        }
+                    }
+                    appContext.startActivity(launchIntent)
+                } catch (_: Exception) {
+                }
             }
 
             SystemNotificationAndFcmManager.ACTION_CALL_DECLINE,
             SystemNotificationAndFcmManager.ACTION_CALL_END -> {
-                SystemNotificationAndFcmManager.activeCallCoordinator?.declineOrHangUpCall()
+                val store = SessionAndMuteStore(appContext)
+                val api = PocketBaseApiClient(store)
+                val coordinator = SystemNotificationAndFcmManager.getOrCreateCallCoordinator(appContext, store, api)
+                if (coordinator.uiState.value.callId.isNotBlank()) {
+                    coordinator.declineOrHangUpCall()
+                } else {
+                    SystemNotificationAndFcmManager.cancelCallNotification(appContext)
+                    CallForegroundService.stop(appContext)
+                    if (callIdFromIntent.isNotBlank() && store.getAuthToken().isNotBlank()) {
+                        val pendingResult = goAsync()
+                        CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+                            try {
+                                if (action == SystemNotificationAndFcmManager.ACTION_CALL_DECLINE) {
+                                    api.rejectCall(callIdFromIntent)
+                                } else {
+                                    api.endCall(callIdFromIntent)
+                                }
+                            } catch (_: Exception) {
+                            } finally {
+                                pendingResult.finish()
+                            }
+                        }
+                    }
+                }
             }
 
             SystemNotificationAndFcmManager.ACTION_DIRECT_REPLY -> {
