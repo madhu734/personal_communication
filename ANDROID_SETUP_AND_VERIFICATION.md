@@ -37,8 +37,18 @@
   ```bash
   gradle :app:testDebugUnitTest
   ```
-- **Export to Android Studio**:
-  Use the AI Studio **Export ZIP** option from the project settings menu to download the complete Gradle project.
+- **Export to Android Studio / Push to GitHub**:
+  Use the AI Studio **Export ZIP** or **Push to GitHub** option from the project settings menu.
+
+### Automated GitHub Actions Signed APK & Release Workflow (`.github/workflows/release-apk.yml`)
+- **Zero-Config Automatic Release**: Every push to `main` or `master` (or any `v*` tag, or manual click on **Run workflow** in the GitHub Actions tab) automatically compiles a **signed release APK** (`gradle :app:assembleRelease`) and publishes it directly to your repository's **GitHub Releases** page (`Apun-Ka-Communication-v1.0.<run_number>-signed.apk` and `Apun-Ka-Communication-latest.apk`).
+- **Using Your Own Persistent Upload Keystore (Optional Recommended for Smooth In-Place App Updates)**:
+  - If no secrets are added, the workflow automatically generates a valid self-signed release keystore (`alias = upload`) so your first push immediately produces a signed APK on the Releases page.
+  - To sign every future GitHub release with the exact same persistent key (so users can install new updates over existing ones without uninstalling), add these 3 secrets under **GitHub Repository -> Settings -> Secrets and variables -> Actions**:
+    1. `KEYSTORE_BASE64`: Base64-encoded `.jks` keystore file containing key alias `upload` (`base64 -w 0 my-upload-key.jks`)
+    2. `STORE_PASSWORD`: Your keystore password
+    3. `KEY_PASSWORD`: Your key password for alias `upload`
+  - *(Optional)* `GOOGLE_SERVICES_JSON_BASE64`: Base64-encoded `app/google-services.json` if you do not commit `app/google-services.json` directly to the repository.
 
 ---
 

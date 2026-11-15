@@ -121,7 +121,7 @@ object SystemNotificationAndFcmManager {
         }
     }
 
-    fun showOngoingOrIncomingCallNotification(
+    fun buildCallNotification(
         context: Context,
         state: ActiveCallUiState,
         isIncoming: Boolean
@@ -137,11 +137,6 @@ object SystemNotificationAndFcmManager {
             openAppIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
-
-        val callerPerson = Person.Builder()
-            .setName(state.peer.name.ifBlank { "Apun Ka Contact" })
-            .setImportant(true)
-            .build()
 
         val answerIntent = Intent(context, NotificationActionReceiver::class.java).apply {
             action = ACTION_CALL_ANSWER
@@ -165,33 +160,19 @@ object SystemNotificationAndFcmManager {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        val callStyle = if (isIncoming) {
-            NotificationCompat.CallStyle.forIncomingCall(
-                callerPerson,
-                declinePending,
-                answerPending
-            ).setIsVideo(state.kind == CallKind.VIDEO)
-        } else {
-            NotificationCompat.CallStyle.forOngoingCall(
-                callerPerson,
-                declinePending
-            ).setIsVideo(state.kind == CallKind.VIDEO)
-        }
-
         val publicFallback = NotificationCompat.Builder(context, CHANNEL_CALLS)
-            .setSmallIcon(android.R.drawable.sym_action_call)
+            .setSmallIcon(R.drawable.ic_launcher_foreground)
             .setContentTitle("Apun Ka Communication")
             .setContentText(if (isIncoming) "Incoming call" else "Ongoing call")
             .build()
 
         val builder = NotificationCompat.Builder(context, CHANNEL_CALLS)
-            .setSmallIcon(android.R.drawable.sym_action_call)
-            .setContentTitle(state.peer.name.ifBlank { "Incoming Call" })
+            .setSmallIcon(R.drawable.ic_launcher_foreground)
+            .setContentTitle(state.peer.name.ifBlank { "Call" })
             .setContentText(
                 if (isIncoming) "Incoming ${state.kind.wireName} call"
                 else "Ongoing ${state.kind.wireName} call"
             )
-            .setStyle(callStyle)
             .setPriority(NotificationCompat.PRIORITY_MAX)
             .setCategory(NotificationCompat.CATEGORY_CALL)
             .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
@@ -204,10 +185,41 @@ object SystemNotificationAndFcmManager {
             builder.setFullScreenIntent(contentPendingIntent, true)
         }
 
-        val notification = builder.build()
+        if (isIncoming) {
+            builder.addAction(
+                R.drawable.ic_launcher_foreground,
+                context.getString(R.string.action_answer),
+                answerPending
+            )
+            builder.addAction(
+                R.drawable.ic_launcher_foreground,
+                context.getString(R.string.action_decline),
+                declinePending
+            )
+        } else {
+            builder.addAction(
+                R.drawable.ic_launcher_foreground,
+                context.getString(R.string.action_hang_up),
+                declinePending
+            )
+        }
+
+        return builder.build()
+    }
+
+    fun showOngoingOrIncomingCallNotification(
+        context: Context,
+        state: ActiveCallUiState,
+        isIncoming: Boolean
+    ): Notification {
+        val notification = buildCallNotification(
+            context = context,
+            state = state,
+            isIncoming = isIncoming
+        )
         try {
             NotificationManagerCompat.from(context).notify(CALL_NOTIFICATION_ID, notification)
-        } catch (_: SecurityException) {
+        } catch (_: Throwable) {
         }
         return notification
     }
@@ -300,7 +312,7 @@ object SystemNotificationAndFcmManager {
         )
 
         val replyAction = NotificationCompat.Action.Builder(
-            android.R.drawable.ic_menu_send,
+            R.drawable.ic_launcher_foreground,
             context.getString(R.string.action_reply),
             replyPendingIntent
         )
@@ -321,7 +333,7 @@ object SystemNotificationAndFcmManager {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
         val muteAction = NotificationCompat.Action.Builder(
-            android.R.drawable.ic_lock_silent_mode,
+            R.drawable.ic_launcher_foreground,
             context.getString(R.string.action_mute),
             mutePendingIntent
         ).build()
@@ -338,13 +350,13 @@ object SystemNotificationAndFcmManager {
         )
 
         val publicFallback = NotificationCompat.Builder(context, CHANNEL_MESSAGES)
-            .setSmallIcon(android.R.drawable.stat_notify_chat)
+            .setSmallIcon(R.drawable.ic_launcher_foreground)
             .setContentTitle("Apun Ka Communication")
             .setContentText("New private message")
             .build()
 
         val builder = NotificationCompat.Builder(context, CHANNEL_MESSAGES)
-            .setSmallIcon(android.R.drawable.stat_notify_chat)
+            .setSmallIcon(R.drawable.ic_launcher_foreground)
             .setStyle(messagingStyle)
             .setGroup("chat_group_$conversationId")
             .setPriority(NotificationCompat.PRIORITY_HIGH)
@@ -374,7 +386,7 @@ object SystemNotificationAndFcmManager {
             )
             builder.addAction(
                 NotificationCompat.Action.Builder(
-                    android.R.drawable.stat_notify_sync,
+                    R.drawable.ic_launcher_foreground,
                     context.getString(R.string.action_retry_reply),
                     retryPending
                 ).build()
@@ -392,6 +404,15 @@ object SystemNotificationAndFcmManager {
         try {
             NotificationManagerCompat.from(context)
                 .cancel(conversationNotificationId(conversationId))
+        } catch (_: Exception) {
+        }
+    }
+
+    fun cancelAllNotifications(context: Context) {
+        conversationHistoryMap.clear()
+        deduplicatedMessageEvents.clear()
+        try {
+            NotificationManagerCompat.from(context).cancelAll()
         } catch (_: Exception) {
         }
     }
@@ -772,15 +793,28 @@ class CallForegroundService : Service() {
             callId = "ongoing",
             kind = CallKind.AUDIO
         )
-        val notification = SystemNotificationAndFcmManager.showOngoingOrIncomingCallNotification(
+        val notification = SystemNotificationAndFcmManager.buildCallNotification(
             context = applicationContext,
             state = state,
             isIncoming = false
         )
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                val fgsType = ServiceInfo.FOREGROUND_SERVICE_TYPE_PHONE_CALL or
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+                var fgsType = ServiceInfo.FOREGROUND_SERVICE_TYPE_PHONE_CALL
+                if ( androidx.core.content.ContextCompat.checkSelfPermission(
+                        applicationContext,
+                        android.Manifest.permission.RECORD_AUDIO
+                    ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+                ) {
+                    fgsType = fgsType or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+                }
+                if (androidx.core.content.ContextCompat.checkSelfPermission(
+                        applicationContext,
+                        android.Manifest.permission.CAMERA
+                    ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+                ) {
+                    fgsType = fgsType or ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
+                }
                 startForeground(
                     SystemNotificationAndFcmManager.CALL_NOTIFICATION_ID,
                     notification,
@@ -792,7 +826,23 @@ class CallForegroundService : Service() {
                     notification
                 )
             }
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    startForeground(
+                        SystemNotificationAndFcmManager.CALL_NOTIFICATION_ID,
+                        notification,
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_PHONE_CALL
+                    )
+                } else {
+                    startForeground(
+                        SystemNotificationAndFcmManager.CALL_NOTIFICATION_ID,
+                        notification
+                    )
+                }
+            } catch (_: Throwable) {
+                stopSelf()
+            }
         }
         return START_NOT_STICKY
     }

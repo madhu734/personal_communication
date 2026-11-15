@@ -7,10 +7,6 @@ import android.content.pm.PackageManager
 import android.media.projection.MediaProjectionManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.camera.core.CameraSelector
-import androidx.camera.core.Preview
-import androidx.camera.lifecycle.ProcessCameraProvider
-import androidx.camera.view.PreviewView
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -67,23 +63,27 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import android.graphics.Bitmap
+import androidx.compose.foundation.Image
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
-import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.call.CallCoordinator
 import com.example.model.ActiveCallUiState
@@ -99,9 +99,10 @@ import com.example.ui.theme.DeepForestBg
 import com.example.ui.theme.ElevatedPineSurface
 import com.example.ui.theme.EmeraldPrimaryDark
 import com.example.ui.theme.JetBrainsMonoFontFamily
-import io.livekit.android.renderer.TextureViewRenderer
 import io.livekit.android.room.Room
 import io.livekit.android.room.track.VideoTrack
+import livekit.org.webrtc.VideoFrame
+import livekit.org.webrtc.VideoSink
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -119,10 +120,46 @@ fun FullScreenCallOverlay(
     var showAudioEndpointSheet by remember { mutableStateOf(false) }
     var showQualitySheet by remember { mutableStateOf(false) }
 
+    val micPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) {
+            coordinator.ensureMicrophonePublishedIfPermitted()
+        }
+    }
+
+    LaunchedEffect(callState.phase) {
+        if (callState.phase == CallPhase.ANSWERING ||
+            callState.phase == CallPhase.CONNECTING ||
+            callState.phase == CallPhase.ACTIVE
+        ) {
+            val hasMic = ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.RECORD_AUDIO
+            ) == PackageManager.PERMISSION_GRANTED
+            if (hasMic) {
+                coordinator.ensureMicrophonePublishedIfPermitted()
+            } else {
+                micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+            }
+        }
+    }
+
     val cameraPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
     ) { _ ->
         coordinator.toggleCamera()
+    }
+
+    var pendingAnswerWithVideo by remember { mutableStateOf<Boolean?>(null) }
+    val answerPermissionsLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions()
+    ) { _ ->
+        val withVideo = pendingAnswerWithVideo
+        pendingAnswerWithVideo = null
+        if (withVideo != null) {
+            coordinator.answerIncomingCall(withVideo = withVideo)
+        }
     }
 
     val mediaProjectionLauncher = rememberLauncherForActivityResult(
@@ -320,14 +357,55 @@ fun FullScreenCallOverlay(
             if (callState.phase == CallPhase.INCOMING_RINGING && !callState.isOutgoing) {
                 IncomingCallAnswerDock(
                     isVideoCall = callState.kind == CallKind.VIDEO,
-                    onAnswerAudio = { coordinator.answerIncomingCall(withVideo = false) },
-                    onAnswerVideo = { coordinator.answerIncomingCall(withVideo = true) },
+                    onAnswerAudio = {
+                        val hasAudio = ContextCompat.checkSelfPermission(
+                            context,
+                            Manifest.permission.RECORD_AUDIO
+                        ) == PackageManager.PERMISSION_GRANTED
+                        if (hasAudio) {
+                            coordinator.answerIncomingCall(withVideo = false)
+                        } else {
+                            pendingAnswerWithVideo = false
+                            answerPermissionsLauncher.launch(arrayOf(Manifest.permission.RECORD_AUDIO))
+                        }
+                    },
+                    onAnswerVideo = {
+                        val hasAudio = ContextCompat.checkSelfPermission(
+                            context,
+                            Manifest.permission.RECORD_AUDIO
+                        ) == PackageManager.PERMISSION_GRANTED
+                        val hasCam = ContextCompat.checkSelfPermission(
+                            context,
+                            Manifest.permission.CAMERA
+                        ) == PackageManager.PERMISSION_GRANTED
+                        if (hasAudio && hasCam) {
+                            coordinator.answerIncomingCall(withVideo = true)
+                        } else {
+                            pendingAnswerWithVideo = true
+                            answerPermissionsLauncher.launch(
+                                arrayOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.CAMERA)
+                            )
+                        }
+                    },
                     onDecline = { coordinator.declineOrHangUpCall() }
                 )
             } else {
                 ActiveCallControlDock(
                     callState = callState,
-                    onToggleMic = { coordinator.toggleMic() },
+                    onToggleMic = {
+                        val hasMicPerm = ContextCompat.checkSelfPermission(
+                            context,
+                            Manifest.permission.RECORD_AUDIO
+                        ) == PackageManager.PERMISSION_GRANTED
+                        if (!hasMicPerm && !callState.isMicEnabled) {
+                            coordinator.toggleMic()
+                            micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                        } else if (!hasMicPerm) {
+                            micPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                        } else {
+                            coordinator.toggleMic()
+                        }
+                    },
                     onToggleCamera = {
                         val hasCamPerm = ContextCompat.checkSelfPermission(
                             context,
@@ -433,42 +511,102 @@ private fun RemoteCallMediaSurface(
 
 @Composable
 private fun LiveKitVideoRendererView(
-    room: Room,
+    @Suppress("UNUSED_PARAMETER") room: Room,
     videoTrack: VideoTrack,
     modifier: Modifier = Modifier
 ) {
-    var rendererRef by remember { mutableStateOf<TextureViewRenderer?>(null) }
+    var currentFrameBitmap by remember(videoTrack) { mutableStateOf<ImageBitmap?>(null) }
 
-    DisposableEffect(room, videoTrack, rendererRef) {
-        val renderer = rendererRef
-        if (renderer != null) {
-            try {
-                videoTrack.addRenderer(renderer)
-            } catch (_: Exception) {
+    DisposableEffect(videoTrack) {
+        var lastFrameTimeMs = 0L
+        val sink = VideoSink { frame ->
+            val now = System.currentTimeMillis()
+            if (now - lastFrameTimeMs < 66L) return@VideoSink
+            lastFrameTimeMs = now
+            val bmp = convertVideoFrameToBitmap(frame)
+            if (bmp != null) {
+                currentFrameBitmap = bmp.asImageBitmap()
             }
         }
+        try {
+            videoTrack.addRenderer(sink)
+        } catch (_: Exception) {
+        }
         onDispose {
-            if (renderer != null) {
-                try {
-                    videoTrack.removeRenderer(renderer)
-                } catch (_: Exception) {
-                }
+            try {
+                videoTrack.removeRenderer(sink)
+            } catch (_: Exception) {
             }
         }
     }
 
-    AndroidView(
-        factory = { ctx ->
-            TextureViewRenderer(ctx).apply {
-                try {
-                    room.initVideoRenderer(this)
-                } catch (_: Exception) {
-                }
-                rendererRef = this
+    val frameBitmap = currentFrameBitmap
+    Box(
+        modifier = modifier.background(DeepForestBg),
+        contentAlignment = Alignment.Center
+    ) {
+        if (frameBitmap != null) {
+            Image(
+                bitmap = frameBitmap,
+                contentDescription = "Call video stream",
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize()
+            )
+        }
+    }
+}
+
+private fun convertVideoFrameToBitmap(frame: VideoFrame): Bitmap? {
+    val i420 = try {
+        frame.buffer.toI420()
+    } catch (_: Exception) {
+        null
+    } ?: return null
+
+    return try {
+        val srcWidth = i420.width
+        val srcHeight = i420.height
+        if (srcWidth <= 0 || srcHeight <= 0) return null
+        val step = if (srcWidth > 320) 2 else 1
+        val outWidth = (srcWidth / step).coerceAtLeast(1)
+        val outHeight = (srcHeight / step).coerceAtLeast(1)
+        val pixels = IntArray(outWidth * outHeight)
+        val yBuf = i420.dataY
+        val uBuf = i420.dataU
+        val vBuf = i420.dataV
+        val yStride = i420.strideY
+        val uStride = i420.strideU
+        val vStride = i420.strideV
+
+        var outIdx = 0
+        for (oy in 0 until outHeight) {
+            val sy = oy * step
+            val yRowOffset = sy * yStride
+            val uvRow = sy shr 1
+            val uRowOffset = uvRow * uStride
+            val vRowOffset = uvRow * vStride
+            for (ox in 0 until outWidth) {
+                val sx = ox * step
+                val uvCol = sx shr 1
+                val yVal = (yBuf.get(yRowOffset + sx).toInt() and 0xFF) - 16
+                val uVal = (uBuf.get(uRowOffset + uvCol).toInt() and 0xFF) - 128
+                val vVal = (vBuf.get(vRowOffset + uvCol).toInt() and 0xFF) - 128
+                val y1192 = 1192 * yVal.coerceAtLeast(0)
+                val r = ((y1192 + 1634 * vVal) shr 10).coerceIn(0, 255)
+                val g = ((y1192 - 833 * vVal - 400 * uVal) shr 10).coerceIn(0, 255)
+                val b = ((y1192 + 2066 * uVal) shr 10).coerceIn(0, 255)
+                pixels[outIdx++] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
             }
-        },
-        modifier = modifier
-    )
+        }
+        Bitmap.createBitmap(pixels, outWidth, outHeight, Bitmap.Config.ARGB_8888)
+    } catch (_: Exception) {
+        null
+    } finally {
+        try {
+            i420.release()
+        } catch (_: Exception) {
+        }
+    }
 }
 
 @Composable
@@ -478,44 +616,6 @@ private fun LocalCameraPreviewCard(
     isFrontCamera: Boolean,
     onFlipCamera: () -> Unit
 ) {
-    val lifecycleOwner = LocalLifecycleOwner.current
-    var previewViewRef by remember { mutableStateOf<PreviewView?>(null) }
-
-    // Bind CameraX ONLY when isFrontCamera or previewView changes — NEVER on every 1-second call timer tick!
-    DisposableEffect(lifecycleOwner, isFrontCamera, previewViewRef, localVideoTrack) {
-        val previewView = previewViewRef
-        var cameraProvider: ProcessCameraProvider? = null
-        if (localVideoTrack == null && previewView != null) {
-            try {
-                val cameraProviderFuture = ProcessCameraProvider.getInstance(previewView.context)
-                cameraProviderFuture.addListener({
-                    try {
-                        val provider = cameraProviderFuture.get()
-                        cameraProvider = provider
-                        val preview = Preview.Builder().build().also {
-                            it.surfaceProvider = previewView.surfaceProvider
-                        }
-                        val selector = if (isFrontCamera) {
-                            CameraSelector.DEFAULT_FRONT_CAMERA
-                        } else {
-                            CameraSelector.DEFAULT_BACK_CAMERA
-                        }
-                        provider.unbindAll()
-                        provider.bindToLifecycle(lifecycleOwner, selector, preview)
-                    } catch (_: Exception) {
-                    }
-                }, ContextCompat.getMainExecutor(previewView.context))
-            } catch (_: Exception) {
-            }
-        }
-        onDispose {
-            try {
-                cameraProvider?.unbindAll()
-            } catch (_: Exception) {
-            }
-        }
-    }
-
     Card(
         shape = RoundedCornerShape(16.dp),
         colors = CardDefaults.cardColors(containerColor = ElevatedPineSurface),
@@ -532,15 +632,27 @@ private fun LocalCameraPreviewCard(
                     modifier = Modifier.fillMaxSize()
                 )
             } else {
-                AndroidView(
-                    factory = { ctx ->
-                        PreviewView(ctx).apply {
-                            implementationMode = PreviewView.ImplementationMode.COMPATIBLE
-                            previewViewRef = this
-                        }
-                    },
-                    modifier = Modifier.fillMaxSize()
-                )
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(ElevatedPineSurface),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                        Icon(
+                            imageVector = Icons.Default.Videocam,
+                            contentDescription = null,
+                            tint = Color(0xFFA7F3D0),
+                            modifier = Modifier.size(28.dp)
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = if (isFrontCamera) "Front" else "Rear",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = Color(0xFFA7F3D0)
+                        )
+                    }
+                }
             }
 
             IconButton(

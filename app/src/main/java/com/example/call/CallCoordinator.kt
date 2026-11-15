@@ -7,6 +7,7 @@ import android.media.AudioAttributes
 import android.media.AudioDeviceInfo
 import android.media.AudioFocusRequest
 import android.media.AudioManager
+import android.media.MediaRecorder
 import android.media.Ringtone
 import android.media.RingtoneManager
 import android.os.Build
@@ -29,14 +30,24 @@ import io.livekit.android.AudioOptions
 import io.livekit.android.AudioType
 import io.livekit.android.LiveKit
 import io.livekit.android.LiveKitOverrides
+import io.livekit.android.audio.NoAudioHandler
 import io.livekit.android.events.RoomEvent
 import io.livekit.android.events.collect
 import io.livekit.android.room.Room
+import io.livekit.android.room.track.AudioTrack
 import io.livekit.android.room.track.CameraPosition
 import io.livekit.android.room.track.LocalVideoTrack
 import io.livekit.android.room.track.Track
 import io.livekit.android.room.track.VideoTrack
 import kotlinx.coroutines.CoroutineScope
+import livekit.org.webrtc.EglBase
+import livekit.org.webrtc.SoftwareVideoDecoderFactory
+import livekit.org.webrtc.SoftwareVideoEncoderFactory
+import livekit.org.webrtc.VideoCodecInfo
+import livekit.org.webrtc.VideoDecoder
+import livekit.org.webrtc.VideoDecoderFactory
+import livekit.org.webrtc.VideoEncoder
+import livekit.org.webrtc.VideoEncoderFactory
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -64,6 +75,7 @@ class CallCoordinator(
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val callMutex = Mutex()
+    private val roomLifecycleMutex = Mutex()
     private val seenTerminalCallIds = ConcurrentHashMap.newKeySet<String>()
     private val roomJoinedCallIds = ConcurrentHashMap.newKeySet<String>()
 
@@ -157,12 +169,12 @@ class CallCoordinator(
                     )
                 }
 
+                CallForegroundService.start(appContext, record.kind == CallKind.VIDEO)
                 SystemNotificationAndFcmManager.showOngoingOrIncomingCallNotification(
                     context = appContext,
                     state = _uiState.value,
                     isIncoming = false
                 )
-                CallForegroundService.start(appContext, record.kind == CallKind.VIDEO)
                 scheduleRingExpiryTimer(record.id, expiresMs)
                 startAuthoritativeCallPoller(record.id)
             } catch (e: Exception) {
@@ -413,15 +425,23 @@ class CallCoordinator(
             if (!proceed) return@launch
 
             try {
-                val fresh = apiClient.fetchCallRecord(callId)
-                val ownUserId = sessionStore.getUserRecord()?.id.orEmpty()
-                if (fresh.receiver != ownUserId ||
-                    (fresh.status != CallRecordStatus.RINGING && fresh.status != CallRecordStatus.ACCEPTED)
-                ) {
-                    terminateCallInternal(callId, "Call is no longer ringing")
-                    return@launch
+                val accepted = try {
+                    apiClient.acceptCall(callId)
+                } catch (e: ApiException) {
+                    // If the call was already accepted via another event/retry, verify state before failing
+                    val record = try {
+                        apiClient.fetchCallRecord(callId)
+                    } catch (_: Exception) {
+                        null
+                    }
+                    if (record != null &&
+                        (record.status == CallRecordStatus.ACCEPTED || record.status == CallRecordStatus.CONNECTED)
+                    ) {
+                        record
+                    } else {
+                        throw e
+                    }
                 }
-                val accepted = apiClient.acceptCall(callId)
                 CallForegroundService.start(appContext, accepted.kind == CallKind.VIDEO)
                 if (roomJoinedCallIds.add(callId)) {
                     connectToLiveKitRoom(callId)
@@ -466,12 +486,26 @@ class CallCoordinator(
     private fun connectToLiveKitRoom(callId: String) {
         scope.launch {
             try {
-                val grant = apiClient.fetchCallToken(callId)
+                var grantError: Exception? = null
+                var grant = null as com.example.model.CallTokenGrant?
+                for (attempt in 0..2) {
+                    if (_uiState.value.callId != callId || _uiState.value.phase == CallPhase.ENDED) {
+                        return@launch
+                    }
+                    try {
+                        grant = apiClient.fetchCallToken(callId)
+                        break
+                    } catch (e: Exception) {
+                        grantError = e
+                        if (attempt < 2) delay(600L)
+                    }
+                }
+                val validGrant = grant ?: throw (grantError ?: IllegalStateException("Unable to fetch call token"))
                 joinLiveKitWebRtcRoom(
                     callId = callId,
-                    roomName = grant.roomName,
-                    wsUrl = grant.wsUrl,
-                    jwtToken = grant.token
+                    roomName = validGrant.roomName,
+                    wsUrl = validGrant.wsUrl,
+                    jwtToken = validGrant.token
                 )
             } catch (e: Exception) {
                 roomJoinedCallIds.remove(callId)
@@ -489,8 +523,10 @@ class CallCoordinator(
         ringTimeoutJob?.cancel()
         stopRingtoneAsync()
 
+        // Ensure ForegroundService is active with MICROPHONE / CAMERA types before WebRTC opens audio/video
+        CallForegroundService.start(appContext, _uiState.value.kind == CallKind.VIDEO)
+
         val endpoints = withContext(Dispatchers.IO) {
-            requestCallAudioFocusBlocking()
             querySystemAudioEndpoints()
         }
         val defaultRoute = if (_uiState.value.kind == CallKind.VIDEO) {
@@ -500,7 +536,6 @@ class CallCoordinator(
                 ?: endpoints.firstOrNull { it.type == AudioEndpointType.WIRED_HEADSET }
                 ?: endpoints.first()
         }
-        ioScope.launch { applySystemAudioEndpointBlocking(defaultRoute) }
 
         _uiState.update {
             it.copy(
@@ -513,8 +548,40 @@ class CallCoordinator(
         }
 
         try {
-            disconnectActiveRoomAsync()
-            val room = LiveKit.create(appContext = appContext)
+            // Wait for any previous LiveKit room teardown to finish completely before creating a new Room
+            // or acquiring audio focus so delayed release() never resets AudioManager.mode mid-call.
+            disconnectActiveRoomSuspend()
+
+            withContext(Dispatchers.IO) {
+                stopRingtoneBlocking()
+                requestCallAudioFocusBlocking()
+                applySystemAudioEndpointBlocking(defaultRoute)
+            }
+
+            val isEmulator = isRunningOnEmulator()
+            val room = LiveKit.create(
+                appContext = appContext,
+                overrides = LiveKitOverrides(
+                    videoEncoderFactory = if (isEmulator) LazySoftwareVideoEncoderFactory() else null,
+                    videoDecoderFactory = if (isEmulator) LazySoftwareVideoDecoderFactory() else null,
+                    audioOptions = AudioOptions(
+                        audioOutputType = AudioType.CallAudioType(),
+                        audioHandler = NoAudioHandler(),
+                        disableCommunicationModeWorkaround = true,
+                        javaAudioDeviceModuleCustomizer = { builder ->
+                            builder.setUseHardwareAcousticEchoCanceler(!isEmulator)
+                            builder.setUseHardwareNoiseSuppressor(!isEmulator)
+                            builder.setAudioSource(
+                                if (isEmulator) MediaRecorder.AudioSource.MIC
+                                else MediaRecorder.AudioSource.VOICE_COMMUNICATION
+                            )
+                            builder.setUseStereoInput(false)
+                            builder.setUseStereoOutput(false)
+                        }
+                    ),
+                    eglBase = if (isEmulator) SoftwareOnlyEglBase() else null
+                )
+            )
             activeLiveKitRoom = room
             _activeRoomFlow.value = room
 
@@ -526,6 +593,15 @@ class CallCoordinator(
                             val track = event.track
                             if (track is VideoTrack) {
                                 _remoteVideoTrack.value = track
+                            } else if (track is AudioTrack) {
+                                try {
+                                    room.setSpeakerMute(false)
+                                } catch (_: Exception) {
+                                }
+                                ioScope.launch {
+                                    requestCallAudioFocusBlocking()
+                                    applySystemAudioEndpointBlocking(_uiState.value.currentEndpoint)
+                                }
                             }
                         }
 
@@ -557,6 +633,10 @@ class CallCoordinator(
                                         statusBannerText = "Connected"
                                     )
                                 }
+                                ioScope.launch {
+                                    requestCallAudioFocusBlocking()
+                                    applySystemAudioEndpointBlocking(_uiState.value.currentEndpoint)
+                                }
                             }
                         }
 
@@ -575,16 +655,58 @@ class CallCoordinator(
                 }
             }
 
-            withContext(Dispatchers.IO) {
-                room.connect(url = wsUrl, token = jwtToken)
+            // Connect with up to 3 attempts so transient ICE / WebSocket hiccups recover automatically
+            var connectException: Exception? = null
+            var activeUrl = wsUrl
+            var activeToken = jwtToken
+            for (attempt in 0..2) {
+                if (_uiState.value.callId != callId || _uiState.value.phase == CallPhase.ENDED) {
+                    return
+                }
+                try {
+                    if (attempt > 0) {
+                        val refreshedGrant = apiClient.fetchCallToken(callId)
+                        activeUrl = refreshedGrant.wsUrl
+                        activeToken = refreshedGrant.token
+                    }
+                    withContext(Dispatchers.IO) {
+                        room.connect(url = activeUrl, token = activeToken)
+                    }
+                    connectException = null
+                    break
+                } catch (e: Exception) {
+                    connectException = e
+                    if (attempt < 2) delay(700L)
+                }
+            }
+            if (connectException != null) {
+                throw connectException
             }
 
-            // Enable microphone and camera if permissions are granted
+            try {
+                room.setSpeakerMute(false)
+                room.setMicrophoneMute(!_uiState.value.isMicEnabled)
+            } catch (_: Exception) {
+            }
+
+            withContext(Dispatchers.IO) {
+                requestCallAudioFocusBlocking()
+                applySystemAudioEndpointBlocking(_uiState.value.currentEndpoint)
+            }
+
             val hasMicPerm = ContextCompat.checkSelfPermission(
                 appContext,
                 Manifest.permission.RECORD_AUDIO
             ) == PackageManager.PERMISSION_GRANTED
-            if (hasMicPerm && _uiState.value.isMicEnabled) {
+            val hasAudioInputHardware = withContext(Dispatchers.IO) {
+                try {
+                    audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS).isNotEmpty()
+                } catch (_: Exception) {
+                    true
+                }
+            }
+
+            if (hasMicPerm && !isEmulator && hasAudioInputHardware && _uiState.value.isMicEnabled) {
                 try {
                     room.localParticipant.setMicrophoneEnabled(true)
                 } catch (_: Exception) {
@@ -595,7 +717,11 @@ class CallCoordinator(
                 appContext,
                 Manifest.permission.CAMERA
             ) == PackageManager.PERMISSION_GRANTED
-            if (hasCamPerm && _uiState.value.isCameraEnabled && !_uiState.value.videoQuality.audioOnly) {
+            if (hasCamPerm &&
+                !isEmulator &&
+                _uiState.value.isCameraEnabled &&
+                !_uiState.value.videoQuality.audioOnly
+            ) {
                 try {
                     room.localParticipant.setCameraEnabled(true)
                     updateLocalVideoTrackRef(room)
@@ -636,6 +762,27 @@ class CallCoordinator(
         _localVideoTrack.value = pubTrack as? LocalVideoTrack
     }
 
+    /**
+     * Ensures that if RECORD_AUDIO permission is granted after answering a call (e.g. from a
+     * system notification), the microphone track is immediately enabled and published.
+     */
+    fun ensureMicrophonePublishedIfPermitted() {
+        val room = activeLiveKitRoom ?: return
+        if (isRunningOnEmulator()) return
+        val hasMicPerm = ContextCompat.checkSelfPermission(
+            appContext,
+            Manifest.permission.RECORD_AUDIO
+        ) == PackageManager.PERMISSION_GRANTED
+        if (!hasMicPerm || !_uiState.value.isMicEnabled) return
+        scope.launch {
+            try {
+                room.setMicrophoneMute(false)
+                room.localParticipant.setMicrophoneEnabled(true)
+            } catch (_: Exception) {
+            }
+        }
+    }
+
     fun toggleMic() {
         val next = !_uiState.value.isMicEnabled
         _uiState.update { it.copy(isMicEnabled = next) }
@@ -643,11 +790,13 @@ class CallCoordinator(
         scope.launch {
             try {
                 if (room != null) {
-                    room.localParticipant.setMicrophoneEnabled(next)
-                } else {
-                    withContext(Dispatchers.IO) {
-                        audioManager.isMicrophoneMute = !next
+                    room.setMicrophoneMute(!next)
+                    if (!isRunningOnEmulator()) {
+                        room.localParticipant.setMicrophoneEnabled(next)
                     }
+                }
+                withContext(Dispatchers.IO) {
+                    audioManager.isMicrophoneMute = !next
                 }
             } catch (_: Exception) {
             }
@@ -664,6 +813,7 @@ class CallCoordinator(
             )
         }
         val room = activeLiveKitRoom ?: return
+        if (isRunningOnEmulator()) return
         scope.launch {
             try {
                 room.localParticipant.setCameraEnabled(next)
@@ -779,6 +929,7 @@ class CallCoordinator(
     fun requestAudioEndpointChange(endpoint: AudioEndpointItem) {
         _uiState.update { it.copy(currentEndpoint = endpoint) }
         ioScope.launch {
+            requestCallAudioFocusBlocking()
             val applied = applySystemAudioEndpointBlocking(endpoint)
             if (!applied) {
                 refreshAvailableAudioEndpoints()
@@ -834,6 +985,9 @@ class CallCoordinator(
 
     private fun applySystemAudioEndpointBlocking(endpoint: AudioEndpointItem): Boolean {
         return try {
+            if (audioManager.mode != AudioManager.MODE_IN_COMMUNICATION) {
+                audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+            }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                 val targetDevices = audioManager.availableCommunicationDevices
                 val matched = targetDevices.firstOrNull { dev ->
@@ -926,47 +1080,76 @@ class CallCoordinator(
     private fun requestCallAudioFocusBlocking() {
         try {
             audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
-            val attrs = AudioAttributes.Builder()
-                .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
-                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                .build()
-            val req = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
-                .setAudioAttributes(attrs)
-                .setAcceptsDelayedFocusGain(true)
-                .setOnAudioFocusChangeListener { }
-                .build()
-            audioManager.requestAudioFocus(req)
-            audioFocusRequest = req
+            audioManager.isMicrophoneMute = !_uiState.value.isMicEnabled
+            if (audioFocusRequest == null) {
+                val attrs = AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build()
+                val req = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
+                    .setAudioAttributes(attrs)
+                    .setAcceptsDelayedFocusGain(true)
+                    .setOnAudioFocusChangeListener { focusChange ->
+                        if (focusChange == AudioManager.AUDIOFOCUS_GAIN) {
+                            val phase = _uiState.value.phase
+                            if (phase == CallPhase.ACTIVE || phase == CallPhase.CONNECTING || phase == CallPhase.RECONNECTING) {
+                                audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+                            }
+                        }
+                    }
+                    .build()
+                audioManager.requestAudioFocus(req)
+                audioFocusRequest = req
+            }
         } catch (_: Exception) {
         }
     }
 
     private fun abandonCallAudioFocusBlocking() {
         try {
-            audioFocusRequest?.let { audioManager.abandonAudioFocusRequest(it) }
-            audioFocusRequest = null
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                try {
+                    audioManager.clearCommunicationDevice()
+                } catch (_: Exception) {
+                }
+            }
+            @Suppress("DEPRECATION")
+            audioManager.isSpeakerphoneOn = false
             audioManager.isMicrophoneMute = false
             audioManager.mode = AudioManager.MODE_NORMAL
+            audioFocusRequest?.let { audioManager.abandonAudioFocusRequest(it) }
+            audioFocusRequest = null
         } catch (_: Exception) {
         }
     }
 
-    private fun disconnectActiveRoomAsync() {
-        roomEventsJob?.cancel()
-        roomEventsJob = null
-        _remoteVideoTrack.value = null
-        _localVideoTrack.value = null
-        val room = activeLiveKitRoom
-        activeLiveKitRoom = null
-        _activeRoomFlow.value = null
-        if (room != null) {
-            ioScope.launch {
-                try {
-                    room.disconnect()
-                    room.release()
-                } catch (_: Exception) {
+    private suspend fun disconnectActiveRoomSuspend() {
+        roomLifecycleMutex.withLock {
+            roomEventsJob?.cancel()
+            roomEventsJob = null
+            _remoteVideoTrack.value = null
+            _localVideoTrack.value = null
+            val room = activeLiveKitRoom
+            activeLiveKitRoom = null
+            _activeRoomFlow.value = null
+            if (room != null) {
+                withContext(Dispatchers.IO) {
+                    try {
+                        room.disconnect()
+                    } catch (_: Exception) {
+                    }
+                    try {
+                        room.release()
+                    } catch (_: Exception) {
+                    }
                 }
             }
+        }
+    }
+
+    private fun disconnectActiveRoomAsync() {
+        ioScope.launch {
+            disconnectActiveRoomSuspend()
         }
     }
 
@@ -984,10 +1167,13 @@ class CallCoordinator(
         ringTimeoutJob?.cancel()
         callPollingJob?.cancel()
         durationTimerJob?.cancel()
-        disconnectActiveRoomAsync()
         ioScope.launch {
             stopRingtoneBlocking()
-            abandonCallAudioFocusBlocking()
+            disconnectActiveRoomSuspend()
+            val phase = _uiState.value.phase
+            if (phase == CallPhase.IDLE || phase == CallPhase.ENDED) {
+                abandonCallAudioFocusBlocking()
+            }
         }
         SystemNotificationAndFcmManager.cancelCallNotification(appContext)
         CallForegroundService.stop(appContext)
@@ -1014,4 +1200,84 @@ class CallCoordinator(
             _uiState.value = ActiveCallUiState()
         }
     }
+
+    private fun isRunningOnEmulator(): Boolean {
+        val fp = Build.FINGERPRINT.lowercase()
+        val hw = Build.HARDWARE.lowercase()
+        val model = Build.MODEL.lowercase()
+        val product = Build.PRODUCT.lowercase()
+        return fp.contains("generic") ||
+            fp.contains("emulator") ||
+            hw.contains("ranchu") ||
+            hw.contains("goldfish") ||
+            model.contains("sdk") ||
+            model.contains("emulator") ||
+            product.contains("sdk")
+    }
 }
+
+/**
+ * Software-backed EglBase implementation that avoids allocating hardware EGL14 contexts
+ * or triggering `E/EGL_emulation: eglQueryContext 32c0 EGL_BAD_ATTRIBUTE` on the Android Emulator.
+ */
+private class SoftwareOnlyEglBase : EglBase {
+    private val context = EglBase.Context { 0L }
+
+    override fun createSurface(surface: android.view.Surface?) = Unit
+    override fun createSurface(surfaceTexture: android.graphics.SurfaceTexture?) = Unit
+    override fun createDummyPbufferSurface() = Unit
+    override fun createPbufferSurface(width: Int, height: Int) = Unit
+    override fun getEglBaseContext(): EglBase.Context = context
+    override fun hasSurface(): Boolean = false
+    override fun surfaceWidth(): Int = 0
+    override fun surfaceHeight(): Int = 0
+    override fun releaseSurface() = Unit
+    override fun release() = Unit
+    override fun makeCurrent() = Unit
+    override fun detachCurrent() = Unit
+    override fun swapBuffers() = Unit
+    override fun swapBuffers(timeStampNs: Long) = Unit
+}
+
+/**
+ * Lazily constructs SoftwareVideoEncoderFactory after LiveKit's RTCModule has loaded
+ * `liblkjingle_peerconnection_so.so` via PeerConnectionFactory.initialize().
+ */
+private class LazySoftwareVideoEncoderFactory : VideoEncoderFactory {
+    private val delegate: SoftwareVideoEncoderFactory by lazy {
+        ensureWebRtcNativeLibraryLoaded()
+        SoftwareVideoEncoderFactory()
+    }
+
+    override fun createEncoder(info: VideoCodecInfo?): VideoEncoder? =
+        delegate.createEncoder(info)
+
+    override fun getSupportedCodecs(): Array<VideoCodecInfo> =
+        delegate.supportedCodecs
+}
+
+/**
+ * Lazily constructs SoftwareVideoDecoderFactory after LiveKit's RTCModule has loaded
+ * `liblkjingle_peerconnection_so.so` via PeerConnectionFactory.initialize().
+ */
+private class LazySoftwareVideoDecoderFactory : VideoDecoderFactory {
+    private val delegate: SoftwareVideoDecoderFactory by lazy {
+        ensureWebRtcNativeLibraryLoaded()
+        SoftwareVideoDecoderFactory()
+    }
+
+    override fun createDecoder(info: VideoCodecInfo?): VideoDecoder? =
+        delegate.createDecoder(info)
+
+    override fun getSupportedCodecs(): Array<VideoCodecInfo> =
+        delegate.supportedCodecs
+}
+
+private fun ensureWebRtcNativeLibraryLoaded() {
+    try {
+        System.loadLibrary("lkjingle_peerconnection_so")
+    } catch (_: Throwable) {
+    }
+}
+
+

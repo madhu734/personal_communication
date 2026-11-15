@@ -168,6 +168,21 @@ fun ChatDetailScreen(
         viewModel.startVoiceNoteRecording()
     }
 
+    var pendingCallKind by remember { mutableStateOf<CallKind?>(null) }
+    val callPermissionsLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions()
+    ) { _ ->
+        val kindToStart = pendingCallKind
+        pendingCallKind = null
+        if (kindToStart != null) {
+            viewModel.callCoordinator.startOutgoingCall(
+                conversationId = conversationId,
+                peer = chat.peer,
+                kind = kindToStart
+            )
+        }
+    }
+
     if (selectedMessageForActions != null) {
         val target = selectedMessageForActions!!
         ModalBottomSheet(
@@ -310,11 +325,20 @@ fun ChatDetailScreen(
             actions = {
                 IconButton(
                     onClick = {
-                        viewModel.callCoordinator.startOutgoingCall(
-                            conversationId = conversationId,
-                            peer = chat.peer,
-                            kind = CallKind.AUDIO
-                        )
+                        val hasAudio = ContextCompat.checkSelfPermission(
+                            context,
+                            Manifest.permission.RECORD_AUDIO
+                        ) == PackageManager.PERMISSION_GRANTED
+                        if (hasAudio) {
+                            viewModel.callCoordinator.startOutgoingCall(
+                                conversationId = conversationId,
+                                peer = chat.peer,
+                                kind = CallKind.AUDIO
+                            )
+                        } else {
+                            pendingCallKind = CallKind.AUDIO
+                            callPermissionsLauncher.launch(arrayOf(Manifest.permission.RECORD_AUDIO))
+                        }
                     },
                     modifier = Modifier.testTag("start_audio_call_button")
                 ) {
@@ -327,11 +351,26 @@ fun ChatDetailScreen(
 
                 IconButton(
                     onClick = {
-                        viewModel.callCoordinator.startOutgoingCall(
-                            conversationId = conversationId,
-                            peer = chat.peer,
-                            kind = CallKind.VIDEO
-                        )
+                        val hasAudio = ContextCompat.checkSelfPermission(
+                            context,
+                            Manifest.permission.RECORD_AUDIO
+                        ) == PackageManager.PERMISSION_GRANTED
+                        val hasCam = ContextCompat.checkSelfPermission(
+                            context,
+                            Manifest.permission.CAMERA
+                        ) == PackageManager.PERMISSION_GRANTED
+                        if (hasAudio && hasCam) {
+                            viewModel.callCoordinator.startOutgoingCall(
+                                conversationId = conversationId,
+                                peer = chat.peer,
+                                kind = CallKind.VIDEO
+                            )
+                        } else {
+                            pendingCallKind = CallKind.VIDEO
+                            callPermissionsLauncher.launch(
+                                arrayOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.CAMERA)
+                            )
+                        }
                     },
                     modifier = Modifier.testTag("start_video_call_button")
                 ) {

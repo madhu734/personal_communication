@@ -414,95 +414,114 @@ private fun ForgotPasswordDialog(
 }
 
 @Composable
-fun HistoryLockedBanner(
-    onOpenUnlockModal: () -> Unit
+fun SetBackupPinDialog(
+    isMandatoryForExistingBiometricUser: Boolean = false,
+    errorMessage: String? = null,
+    onDismiss: () -> Unit,
+    onConfirmPinSetup: (String, String) -> Unit
 ) {
-    Surface(
-        color = AmberAlert.copy(alpha = 0.16f),
-        shape = RoundedCornerShape(14.dp),
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 16.dp, vertical = 8.dp)
-            .clickable(onClick = onOpenUnlockModal)
-            .testTag("history_locked_banner")
-    ) {
-        Row(
-            modifier = Modifier.padding(14.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Icon(
-                imageVector = Icons.Default.Lock,
-                contentDescription = "History Locked",
-                tint = AmberAlert
+    var pin by rememberSaveable { mutableStateOf("") }
+    var confirmPin by rememberSaveable { mutableStateOf("") }
+    var localError by rememberSaveable { mutableStateOf<String?>(null) }
+
+    val cleanPin = pin.trim()
+    val cleanConfirm = confirmPin.trim()
+    val isPinFourDigits = cleanPin.length == 4 && cleanPin.all { it.isDigit() }
+    val isConfirmFourDigits = cleanConfirm.length == 4 && cleanConfirm.all { it.isDigit() }
+
+    AlertDialog(
+        onDismissRequest = {
+            if (!isMandatoryForExistingBiometricUser) {
+                onDismiss()
+            }
+        },
+        title = {
+            Text(
+                if (isMandatoryForExistingBiometricUser) {
+                    "Set 4-Digit Backup PIN"
+                } else {
+                    "Set 4-Digit Backup PIN for App Lock"
+                }
             )
-            Spacer(modifier = Modifier.width(12.dp))
-            Column(modifier = Modifier.weight(1f)) {
+        },
+        text = {
+            Column(
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+                modifier = Modifier.testTag("set_backup_pin_dialog")
+            ) {
                 Text(
-                    text = "Earlier History Locked",
-                    style = MaterialTheme.typography.titleMedium,
-                    color = MaterialTheme.colorScheme.onSurface
-                )
-                Text(
-                    text = "Tap to verify with your 6-digit email code.",
+                    text = if (isMandatoryForExistingBiometricUser) {
+                        "Your Biometric App Lock requires a 4-digit backup PIN so you can always unlock the app if biometrics are unavailable."
+                    } else {
+                        "Set and confirm a 4-digit backup PIN before enabling Biometric App Lock. You can use this PIN anytime to unlock the app."
+                    },
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
-            }
-            TextButton(onClick = onOpenUnlockModal) {
-                Text("Unlock")
-            }
-        }
-    }
-}
 
-@Composable
-fun HistoryUnlockDialog(
-    onDismiss: () -> Unit,
-    onRequestCode: () -> Unit,
-    onConfirmCode: (String) -> Unit
-) {
-    var code by rememberSaveable { mutableStateOf("") }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Unlock Earlier Chat History") },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                Text(
-                    text = "Signing in from a new device locks messages prior to sign-in. Request a 6-digit code to your email to restore earlier history.",
-                    style = MaterialTheme.typography.bodyMedium
-                )
-                OutlinedButton(
-                    onClick = onRequestCode,
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text("Send 6-Digit Code to Email")
+                val displayError = localError ?: errorMessage
+                if (!displayError.isNullOrBlank()) {
+                    Text(
+                        text = displayError,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = CoralHangup
+                    )
                 }
+
                 OutlinedTextField(
-                    value = code,
-                    onValueChange = { code = it.take(6) },
-                    label = { Text("6-Digit Code") },
+                    value = pin,
+                    onValueChange = { input ->
+                        pin = input.filter { it.isDigit() }.take(4)
+                        localError = null
+                    },
+                    label = { Text("4-Digit PIN") },
                     singleLine = true,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    visualTransformation = PasswordVisualTransformation(),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
                     modifier = Modifier
                         .fillMaxWidth()
-                        .testTag("history_unlock_code_input")
+                        .testTag("setup_pin_input")
+                )
+
+                OutlinedTextField(
+                    value = confirmPin,
+                    onValueChange = { input ->
+                        confirmPin = input.filter { it.isDigit() }.take(4)
+                        localError = null
+                    },
+                    label = { Text("Confirm 4-Digit PIN") },
+                    singleLine = true,
+                    visualTransformation = PasswordVisualTransformation(),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("setup_pin_confirm_input")
                 )
             }
         },
         confirmButton = {
             Button(
                 onClick = {
-                    onConfirmCode(code)
-                    onDismiss()
+                    if (!isPinFourDigits) {
+                        localError = "Enter a 4-digit PIN (0000–9999)."
+                    } else if (cleanPin != cleanConfirm) {
+                        localError = "The 4-digit PINs do not match."
+                    } else {
+                        onConfirmPinSetup(cleanPin, cleanConfirm)
+                    }
                 },
-                enabled = code.trim().length == 6
+                enabled = isPinFourDigits && isConfirmFourDigits,
+                modifier = Modifier.testTag("confirm_setup_pin_button")
             ) {
-                Text("Verify & Unlock")
+                Text("Save PIN & Enable")
             }
         },
         dismissButton = {
-            TextButton(onClick = onDismiss) {
-                Text("Cancel")
+            TextButton(
+                onClick = onDismiss,
+                modifier = Modifier.testTag("cancel_setup_pin_button")
+            ) {
+                Text(if (isMandatoryForExistingBiometricUser) "Turn Off App Lock" else "Cancel")
             }
         }
     )
@@ -520,7 +539,7 @@ fun AccountAndDiagnosticsScreen(
     var showEditProfileDialog by rememberSaveable { mutableStateOf(false) }
     var showChangePasswordDialog by rememberSaveable { mutableStateOf(false) }
     var showChangeEmailDialog by rememberSaveable { mutableStateOf(false) }
-    var showUnlockDialog by rememberSaveable { mutableStateOf(false) }
+    var showSetBackupPinDialog by rememberSaveable { mutableStateOf(false) }
 
     // Dynamically track whether notifications are enabled; refreshes automatically on resume
     var areNotificationsEnabled by remember {
@@ -599,11 +618,31 @@ fun AccountAndDiagnosticsScreen(
         )
     }
 
-    if (showUnlockDialog) {
-        HistoryUnlockDialog(
-            onDismiss = { showUnlockDialog = false },
-            onRequestCode = { viewModel.requestHistoryUnlockOtp() },
-            onConfirmCode = { viewModel.confirmHistoryUnlockOtp(it) }
+    if (showSetBackupPinDialog) {
+        SetBackupPinDialog(
+            isMandatoryForExistingBiometricUser = false,
+            errorMessage = uiState.pinErrorMessage,
+            onDismiss = {
+                showSetBackupPinDialog = false
+                viewModel.clearPinError()
+            },
+            onConfirmPinSetup = { pin, confirmPin ->
+                promptDeviceBiometricAuth(
+                    context = context,
+                    title = "Enable Biometric App Lock",
+                    subtitle = "Confirm your fingerprint, face, or screen lock",
+                    onSuccess = {
+                        if (viewModel.completeBiometricAndBackupPinSetup(pin, confirmPin)) {
+                            showSetBackupPinDialog = false
+                        }
+                    },
+                    onFallbackNoHardware = {
+                        if (viewModel.completeBiometricAndBackupPinSetup(pin, confirmPin)) {
+                            showSetBackupPinDialog = false
+                        }
+                    }
+                )
+            }
         )
     }
 
@@ -753,7 +792,7 @@ fun AccountAndDiagnosticsScreen(
                             style = MaterialTheme.typography.titleMedium
                         )
                         Text(
-                            text = "Require fingerprint or face unlock after 30 minutes",
+                            text = "Require biometric or 4-digit PIN after 30 minutes",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -762,22 +801,27 @@ fun AccountAndDiagnosticsScreen(
                         checked = uiState.isBiometricLockEnabled,
                         onCheckedChange = { wantEnabled ->
                             if (wantEnabled) {
-                                promptDeviceBiometricAuth(
-                                    context = context,
-                                    title = "Enable Biometric App Lock",
-                                    subtitle = "Confirm your fingerprint, face, or screen lock",
-                                    onSuccess = {
-                                        viewModel.setBiometricAppLockEnabled(true)
-                                    },
-                                    onFallbackNoHardware = {
-                                        viewModel.setBiometricAppLockEnabled(true)
-                                    }
-                                )
+                                viewModel.clearPinError()
+                                showSetBackupPinDialog = true
                             } else {
                                 viewModel.setBiometricAppLockEnabled(false)
                             }
                         },
                         modifier = Modifier.testTag("biometric_lock_switch")
+                    )
+                }
+
+                if (uiState.isBiometricLockEnabled) {
+                    HorizontalDivider(modifier = Modifier.padding(horizontal = 16.dp))
+                    CompactSettingsActionRow(
+                        icon = Icons.Default.Lock,
+                        title = "Change 4-Digit Backup PIN",
+                        subtitle = "Update the backup PIN used when biometrics aren't used",
+                        onClick = {
+                            viewModel.clearPinError()
+                            showSetBackupPinDialog = true
+                        },
+                        testTag = "settings_change_backup_pin_row"
                     )
                 }
 
@@ -800,17 +844,6 @@ fun AccountAndDiagnosticsScreen(
                     onClick = { showChangeEmailDialog = true },
                     testTag = "settings_change_email_row"
                 )
-
-                if (uiState.historyLocked) {
-                    HorizontalDivider(modifier = Modifier.padding(horizontal = 16.dp))
-                    CompactSettingsActionRow(
-                        icon = Icons.Default.Lock,
-                        title = "Unlock Earlier Chat History",
-                        subtitle = "Enter your 6-digit email verification code",
-                        onClick = { showUnlockDialog = true },
-                        testTag = "settings_unlock_history_row"
-                    )
-                }
             }
         }
 
@@ -1080,6 +1113,11 @@ fun promptDeviceBiometricAuth(
             override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
                 super.onAuthenticationSucceeded(result)
                 onSuccess()
+            }
+
+            override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
+                super.onAuthenticationError(errorCode, errString)
+                onFallbackNoHardware()
             }
         }
     )

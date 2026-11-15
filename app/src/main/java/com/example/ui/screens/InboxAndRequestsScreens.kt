@@ -1,5 +1,9 @@
 package com.example.ui.screens
 
+import android.Manifest
+import android.content.pm.PackageManager
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.isSystemInDarkTheme
@@ -54,12 +58,14 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import com.example.call.MuteDurationPickerCard
 import com.example.model.CallKind
 import com.example.model.CallRecord
@@ -88,16 +94,7 @@ fun ChatsListScreen(
     uiState: AppUiState,
     viewModel: AppViewModel
 ) {
-    var showUnlockDialog by rememberSaveable { mutableStateOf(false) }
     var muteTargetChat by remember { mutableStateOf<ChatSummary?>(null) }
-
-    if (showUnlockDialog) {
-        HistoryUnlockDialog(
-            onDismiss = { showUnlockDialog = false },
-            onRequestCode = { viewModel.requestHistoryUnlockOtp() },
-            onConfirmCode = { viewModel.confirmHistoryUnlockOtp(it) }
-        )
-    }
 
     if (muteTargetChat != null) {
         val chat = muteTargetChat!!
@@ -118,10 +115,6 @@ fun ChatsListScreen(
     }
 
     Column(modifier = Modifier.fillMaxSize()) {
-        if (uiState.historyLocked) {
-            HistoryLockedBanner(onOpenUnlockModal = { showUnlockDialog = true })
-        }
-
         if (uiState.chats.isEmpty()) {
             Box(
                 modifier = Modifier
@@ -407,11 +400,7 @@ fun RecentCallsScreen(
             contentAlignment = Alignment.Center
         ) {
             Text(
-                text = if (uiState.historyLocked) {
-                    "Earlier call history is locked until you verify your 6-digit email code."
-                } else {
-                    "No recent calls yet."
-                },
+                text = "No recent calls yet.",
                 style = MaterialTheme.typography.bodyLarge,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -453,6 +442,22 @@ private fun RecentCallRow(
         CallRecordStatus.REJECTED,
         CallRecordStatus.FAILED
     )
+
+    val context = LocalContext.current
+    var pendingCallbackKind by remember { mutableStateOf<CallKind?>(null) }
+    val callbackPermissionsLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions()
+    ) { _ ->
+        val kindToStart = pendingCallbackKind
+        pendingCallbackKind = null
+        if (kindToStart != null) {
+            viewModel.callCoordinator.startOutgoingCall(
+                conversationId = call.conversation,
+                peer = peer,
+                kind = kindToStart
+            )
+        }
+    }
 
     Card(
         shape = RoundedCornerShape(18.dp),
@@ -502,11 +507,20 @@ private fun RecentCallRow(
 
             IconButton(
                 onClick = {
-                    viewModel.callCoordinator.startOutgoingCall(
-                        conversationId = call.conversation,
-                        peer = peer,
-                        kind = CallKind.AUDIO
-                    )
+                    val hasAudio = ContextCompat.checkSelfPermission(
+                        context,
+                        Manifest.permission.RECORD_AUDIO
+                    ) == PackageManager.PERMISSION_GRANTED
+                    if (hasAudio) {
+                        viewModel.callCoordinator.startOutgoingCall(
+                            conversationId = call.conversation,
+                            peer = peer,
+                            kind = CallKind.AUDIO
+                        )
+                    } else {
+                        pendingCallbackKind = CallKind.AUDIO
+                        callbackPermissionsLauncher.launch(arrayOf(Manifest.permission.RECORD_AUDIO))
+                    }
                 },
                 modifier = Modifier.testTag("callback_audio_${call.id}")
             ) {
@@ -519,11 +533,26 @@ private fun RecentCallRow(
 
             IconButton(
                 onClick = {
-                    viewModel.callCoordinator.startOutgoingCall(
-                        conversationId = call.conversation,
-                        peer = peer,
-                        kind = CallKind.VIDEO
-                    )
+                    val hasAudio = ContextCompat.checkSelfPermission(
+                        context,
+                        Manifest.permission.RECORD_AUDIO
+                    ) == PackageManager.PERMISSION_GRANTED
+                    val hasCam = ContextCompat.checkSelfPermission(
+                        context,
+                        Manifest.permission.CAMERA
+                    ) == PackageManager.PERMISSION_GRANTED
+                    if (hasAudio && hasCam) {
+                        viewModel.callCoordinator.startOutgoingCall(
+                            conversationId = call.conversation,
+                            peer = peer,
+                            kind = CallKind.VIDEO
+                        )
+                    } else {
+                        pendingCallbackKind = CallKind.VIDEO
+                        callbackPermissionsLauncher.launch(
+                            arrayOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.CAMERA)
+                        )
+                    }
                 },
                 modifier = Modifier.testTag("callback_video_${call.id}")
             ) {

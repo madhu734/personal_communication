@@ -32,12 +32,14 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Chat
 import androidx.compose.material.icons.filled.Call
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Fingerprint
 import androidx.compose.material.icons.filled.Group
+import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.Badge
@@ -51,6 +53,8 @@ import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.NavigationRail
 import androidx.compose.material3.NavigationRailItem
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -60,11 +64,16 @@ import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
@@ -84,6 +93,7 @@ import com.example.ui.screens.InAppMinimizedCallCard
 import com.example.ui.screens.OsPipCallSurface
 import com.example.ui.screens.PeopleAndRequestsScreen
 import com.example.ui.screens.RecentCallsScreen
+import com.example.ui.screens.SetBackupPinDialog
 import com.example.ui.screens.promptDeviceBiometricAuth
 import com.example.ui.theme.ApunKaTheme
 import com.example.ui.theme.CoralHangup
@@ -225,10 +235,27 @@ fun ApunKaRootContent(
             }
         } else if (uiState.isBiometricLockedNow && callState.phase == CallPhase.IDLE) {
             BiometricAppLockOverlay(
-                onUnlocked = { viewModel.onBiometricUnlockSucceeded() },
-                onSignOut = { viewModel.signOut() }
+                uiState = uiState,
+                onBiometricUnlocked = { viewModel.onBiometricUnlockSucceeded() },
+                onVerifyBackupPin = { pin -> viewModel.unlockWithBackupPin(pin) },
+                onSetMandatoryBackupPin = { pin, confirmPin ->
+                    viewModel.completeBiometricAndBackupPinSetup(pin, confirmPin)
+                },
+                onTurnOffAppLock = { viewModel.setBiometricAppLockEnabled(false) },
+                onClearPinError = { viewModel.clearPinError() },
+                onForgotPinSignOut = { viewModel.recoverForgottenPinBySigningOut() }
             )
         } else {
+            if (uiState.needsBackupPinSetup) {
+                SetBackupPinDialog(
+                    isMandatoryForExistingBiometricUser = true,
+                    errorMessage = uiState.pinErrorMessage,
+                    onDismiss = { viewModel.setBiometricAppLockEnabled(false) },
+                    onConfirmPinSetup = { pin, confirmPin ->
+                        viewModel.completeBiometricAndBackupPinSetup(pin, confirmPin)
+                    }
+                )
+            }
             val totalUnread = uiState.chats.sumOf { it.unreadCount }
             val incomingReqsCount = uiState.requests.count { it.incoming }
 
@@ -444,19 +471,41 @@ fun ApunKaRootContent(
 
 @Composable
 private fun BiometricAppLockOverlay(
-    onUnlocked: () -> Unit,
-    onSignOut: () -> Unit
+    uiState: AppUiState,
+    onBiometricUnlocked: () -> Unit,
+    onVerifyBackupPin: (String) -> Unit,
+    onSetMandatoryBackupPin: (String, String) -> Unit,
+    onTurnOffAppLock: () -> Unit,
+    onClearPinError: () -> Unit,
+    onForgotPinSignOut: () -> Unit
 ) {
     val context = LocalContext.current
+    var usePinMode by rememberSaveable { mutableStateOf(false) }
+    var pinInput by rememberSaveable { mutableStateOf("") }
+
+    if (uiState.needsBackupPinSetup && !uiState.hasBackupPin) {
+        SetBackupPinDialog(
+            isMandatoryForExistingBiometricUser = true,
+            errorMessage = uiState.pinErrorMessage,
+            onDismiss = onTurnOffAppLock,
+            onConfirmPinSetup = onSetMandatoryBackupPin
+        )
+    }
 
     LaunchedEffect(Unit) {
-        promptDeviceBiometricAuth(
-            context = context,
-            title = "Apun Ka Communication Locked",
-            subtitle = "Unlock with fingerprint, face, or screen lock",
-            onSuccess = onUnlocked,
-            onFallbackNoHardware = onUnlocked
-        )
+        if (!usePinMode) {
+            promptDeviceBiometricAuth(
+                context = context,
+                title = "Apun Ka Communication Locked",
+                subtitle = "Unlock with fingerprint, face, or screen lock",
+                onSuccess = onBiometricUnlocked,
+                onFallbackNoHardware = {
+                    if (uiState.hasBackupPin) {
+                        usePinMode = true
+                    }
+                }
+            )
+        }
     }
 
     Box(
@@ -470,19 +519,19 @@ private fun BiometricAppLockOverlay(
         Column(
             modifier = Modifier.widthIn(max = 360.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(16.dp)
+            verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
             Surface(
                 shape = CircleShape,
                 color = MaterialTheme.colorScheme.primaryContainer,
-                modifier = Modifier.size(76.dp)
+                modifier = Modifier.size(72.dp)
             ) {
                 Box(contentAlignment = Alignment.Center) {
                     Icon(
-                        imageVector = Icons.Default.Fingerprint,
-                        contentDescription = "Biometric Lock",
+                        imageVector = if (usePinMode) Icons.Default.Lock else Icons.Default.Fingerprint,
+                        contentDescription = if (usePinMode) "PIN Lock" else "Biometric Lock",
                         tint = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.size(42.dp)
+                        modifier = Modifier.size(38.dp)
                     )
                 }
             }
@@ -493,35 +542,128 @@ private fun BiometricAppLockOverlay(
                 fontWeight = FontWeight.Bold
             )
 
-            Text(
-                text = "Authenticate with your device biometrics to continue. Once unlocked, you won't be asked again for 30 minutes.",
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
+            if (usePinMode) {
+                Text(
+                    text = "Enter your 4-digit backup PIN to unlock.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
 
-            Spacer(modifier = Modifier.height(4.dp))
-
-            Button(
-                onClick = {
-                    promptDeviceBiometricAuth(
-                        context = context,
-                        title = "Apun Ka Communication Locked",
-                        subtitle = "Unlock with fingerprint, face, or screen lock",
-                        onSuccess = onUnlocked,
-                        onFallbackNoHardware = onUnlocked
+                if (!uiState.pinErrorMessage.isNullOrBlank()) {
+                    Text(
+                        text = uiState.pinErrorMessage,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = CoralHangup,
+                        modifier = Modifier.testTag("pin_error_text")
                     )
-                },
-                shape = RoundedCornerShape(14.dp),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(50.dp)
-                    .testTag("biometric_unlock_button")
-            ) {
-                Text("Unlock with Biometrics")
+                }
+
+                OutlinedTextField(
+                    value = pinInput,
+                    onValueChange = { raw ->
+                        pinInput = raw.filter { it.isDigit() }.take(4)
+                        onClearPinError()
+                    },
+                    label = { Text("4-Digit PIN") },
+                    singleLine = true,
+                    enabled = uiState.pinLockoutSeconds <= 0,
+                    visualTransformation = PasswordVisualTransformation(),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                    shape = RoundedCornerShape(14.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("backup_pin_input")
+                )
+
+                Button(
+                    onClick = { onVerifyBackupPin(pinInput) },
+                    enabled = pinInput.length == 4 && uiState.pinLockoutSeconds <= 0,
+                    shape = RoundedCornerShape(14.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(50.dp)
+                        .testTag("verify_pin_button")
+                ) {
+                    Text(
+                        if (uiState.pinLockoutSeconds > 0) {
+                            "Locked (${uiState.pinLockoutSeconds}s)"
+                        } else {
+                            "Unlock with PIN"
+                        }
+                    )
+                }
+
+                TextButton(
+                    onClick = {
+                        usePinMode = false
+                        onClearPinError()
+                        promptDeviceBiometricAuth(
+                            context = context,
+                            title = "Apun Ka Communication Locked",
+                            subtitle = "Unlock with fingerprint, face, or screen lock",
+                            onSuccess = onBiometricUnlocked,
+                            onFallbackNoHardware = { usePinMode = true }
+                        )
+                    },
+                    modifier = Modifier.testTag("switch_to_biometric_button")
+                ) {
+                    Text("Use Biometrics")
+                }
+            } else {
+                Text(
+                    text = "Authenticate with your device biometrics or choose Use PIN to unlock.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+
+                Spacer(modifier = Modifier.height(4.dp))
+
+                Button(
+                    onClick = {
+                        promptDeviceBiometricAuth(
+                            context = context,
+                            title = "Apun Ka Communication Locked",
+                            subtitle = "Unlock with fingerprint, face, or screen lock",
+                            onSuccess = onBiometricUnlocked,
+                            onFallbackNoHardware = { usePinMode = true }
+                        )
+                    },
+                    shape = RoundedCornerShape(14.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(50.dp)
+                        .testTag("biometric_unlock_button")
+                ) {
+                    Text("Unlock with Biometrics")
+                }
+
+                // Small, accessible Use PIN option always visible on the biometric unlock screen
+                OutlinedButton(
+                    onClick = {
+                        onClearPinError()
+                        usePinMode = true
+                    },
+                    shape = RoundedCornerShape(14.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(48.dp)
+                        .testTag("use_pin_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Lock,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Use PIN")
+                }
             }
 
-            TextButton(onClick = onSignOut) {
-                Text("Sign Out")
+            TextButton(
+                onClick = onForgotPinSignOut,
+                modifier = Modifier.testTag("forgot_pin_sign_in_button")
+            ) {
+                Text("Forgot PIN? Sign in again")
             }
         }
     }

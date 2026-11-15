@@ -1,6 +1,7 @@
 package com.example.repository
 
 import android.app.Application
+import android.media.AudioAttributes
 import android.media.MediaPlayer
 import android.media.MediaRecorder
 import android.net.Uri
@@ -39,8 +40,11 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.time.Instant
 import java.util.UUID
@@ -56,9 +60,12 @@ data class AppUiState(
     val isInitialized: Boolean = false,
     val isLoading: Boolean = false,
     val currentUser: UserRecord? = null,
-    val historyLocked: Boolean = false,
     val isBiometricLockEnabled: Boolean = false,
     val isBiometricLockedNow: Boolean = false,
+    val hasBackupPin: Boolean = false,
+    val needsBackupPinSetup: Boolean = false,
+    val pinErrorMessage: String? = null,
+    val pinLockoutSeconds: Int = 0,
     val sseConnected: Boolean = false,
     val activeTab: TopLevelTab = TopLevelTab.CHATS,
     val selectedConversationId: String? = null,
@@ -92,10 +99,14 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private val _uiState = MutableStateFlow(
         AppUiState(
             currentUser = sessionStore.getUserRecord(),
-            historyLocked = sessionStore.historyLocked,
             isBiometricLockEnabled = sessionStore.isBiometricAppLockEnabled,
             isBiometricLockedNow = sessionStore.getUserRecord() != null &&
-                sessionStore.isBiometricUnlockRequired()
+                sessionStore.isBiometricUnlockRequired(),
+            hasBackupPin = sessionStore.hasBackupPin(),
+            needsBackupPinSetup = sessionStore.getUserRecord() != null &&
+                sessionStore.isBiometricAppLockEnabled &&
+                !sessionStore.hasBackupPin(),
+            pinLockoutSeconds = sessionStore.getPinLockoutRemainingSeconds()
         )
     )
     val uiState: StateFlow<AppUiState> = _uiState.asStateFlow()
@@ -103,8 +114,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     private var presenceTickerJob: Job? = null
     private var presenceExpiryWatcherJob: Job? = null
     private var typingStopDebounceJob: Job? = null
+    private var pinLockoutTickerJob: Job? = null
     private var lastTypingSentEpochMs: Long = 0L
     private var voiceRecordTickerJob: Job? = null
+    private val voiceRecorderMutex = Mutex()
     private var mediaRecorder: MediaRecorder? = null
     private var activeVoiceOutputFile: File? = null
     private var mediaPlayer: MediaPlayer? = null
@@ -183,32 +196,46 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             val existingToken = sessionStore.getAuthToken()
             val existingUser = sessionStore.getUserRecord()
             if (existingToken.isNotBlank() && existingUser != null) {
+                val hasPin = sessionStore.hasBackupPin()
+                val bioEnabled = sessionStore.isBiometricAppLockEnabled
                 _uiState.update {
                     it.copy(
                         currentUser = existingUser,
                         isInitialized = true,
-                        isBiometricLockEnabled = sessionStore.isBiometricAppLockEnabled,
-                        isBiometricLockedNow = sessionStore.isBiometricUnlockRequired()
+                        isBiometricLockEnabled = bioEnabled,
+                        isBiometricLockedNow = sessionStore.isBiometricUnlockRequired(),
+                        hasBackupPin = hasPin,
+                        needsBackupPinSetup = bioEnabled && !hasPin,
+                        pinLockoutSeconds = sessionStore.getPinLockoutRemainingSeconds()
                     )
                 }
-                realtimeClient.connectIfAuthenticated()
-                refreshAllAuthenticatedData()
+                if (_uiState.value.pinLockoutSeconds > 0) {
+                    startPinLockoutCountdownTicker()
+                }
                 try {
+                    val sessionValid = apiClient.validateCurrentSession()
+                    if (!sessionValid) {
+                        performLocalSignOutCleanup("Your session ended on this device. Please sign in again.")
+                        return@launch
+                    }
                     val refreshed = apiClient.refreshAuth()
                     sessionStore.saveSession(refreshed.token, refreshed.user)
-                    val historyLocked = apiClient.fetchSessionStatus()
                     _uiState.update {
-                        it.copy(
-                            currentUser = refreshed.user,
-                            historyLocked = historyLocked
-                        )
+                        it.copy(currentUser = refreshed.user)
                     }
+                    realtimeClient.connectIfAuthenticated()
+                    refreshAllAuthenticatedData()
                     registerFcmTokenIfNeeded()
                 } catch (e: ApiException) {
                     if (e.statusCode == 401 && apiClient.isSessionTrulyRevoked()) {
-                        performLocalSignOutCleanup("Session expired or signed in on another device.")
+                        performLocalSignOutCleanup("Your session ended on this device. Please sign in again.")
+                        return@launch
                     }
+                    realtimeClient.connectIfAuthenticated()
+                    refreshAllAuthenticatedData()
                 } catch (_: Exception) {
+                    realtimeClient.connectIfAuthenticated()
+                    refreshAllAuthenticatedData()
                 }
             } else {
                 _uiState.update { it.copy(isInitialized = true) }
@@ -216,46 +243,248 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    // ---------------- Biometric App Lock (30-Minute Timer) ----------------
+    // ---------------- Biometric App Lock & Mandatory 4-Digit Backup PIN ----------------
 
     fun checkBiometricLockStateOnResume() {
         if (_uiState.value.currentUser == null) return
+        if (sessionStore.getAuthToken().isBlank()) {
+            performLocalSignOutCleanup("Your session ended. Please sign in again.")
+            return
+        }
+        val bioEnabled = sessionStore.isBiometricAppLockEnabled
+        val hasPin = sessionStore.hasBackupPin()
         val required = sessionStore.isBiometricUnlockRequired()
+        val lockoutSecs = sessionStore.getPinLockoutRemainingSeconds()
         _uiState.update {
             it.copy(
-                isBiometricLockEnabled = sessionStore.isBiometricAppLockEnabled,
-                isBiometricLockedNow = required
+                isBiometricLockEnabled = bioEnabled,
+                isBiometricLockedNow = required,
+                hasBackupPin = hasPin,
+                needsBackupPinSetup = bioEnabled && !hasPin,
+                pinLockoutSeconds = lockoutSecs
             )
+        }
+        if (lockoutSecs > 0) {
+            startPinLockoutCountdownTicker()
+        }
+        // Validate active session against GET /api/app/account/session on resume
+        viewModelScope.launch {
+            try {
+                if (!apiClient.validateCurrentSession()) {
+                    performLocalSignOutCleanup("Your session ended on this device. Please sign in again.")
+                }
+            } catch (_: Exception) {
+            }
         }
     }
 
     fun onBiometricUnlockSucceeded() {
+        if (sessionStore.getAuthToken().isBlank() || sessionStore.getUserRecord() == null) {
+            performLocalSignOutCleanup("Your session ended. Please sign in again.")
+            return
+        }
+        viewModelScope.launch {
+            try {
+                if (!apiClient.validateCurrentSession()) {
+                    performLocalSignOutCleanup("Your session ended on this device. Please sign in again.")
+                    return@launch
+                }
+            } catch (_: Exception) {
+            }
+            sessionStore.recordBiometricUnlockSuccess()
+            val bioEnabled = sessionStore.isBiometricAppLockEnabled
+            val hasPin = sessionStore.hasBackupPin()
+            _uiState.update {
+                it.copy(
+                    isBiometricLockEnabled = bioEnabled,
+                    isBiometricLockedNow = false,
+                    hasBackupPin = hasPin,
+                    needsBackupPinSetup = bioEnabled && !hasPin,
+                    pinErrorMessage = null
+                )
+            }
+        }
+    }
+
+    /**
+     * Completes biometric setup by setting and confirming a 4-digit backup PIN first.
+     */
+    fun completeBiometricAndBackupPinSetup(pin: String, confirmPin: String): Boolean {
+        if (!sessionStore.isValidPinFormat(pin)) {
+            _uiState.update {
+                it.copy(pinErrorMessage = "Backup PIN must be exactly 4 digits (0000–9999).")
+            }
+            return false
+        }
+        if (pin.trim() != confirmPin.trim()) {
+            _uiState.update {
+                it.copy(pinErrorMessage = "The 4-digit PINs do not match.")
+            }
+            return false
+        }
+        val saved = sessionStore.setBackupPin(pin, confirmPin)
+        if (!saved) {
+            _uiState.update {
+                it.copy(pinErrorMessage = "Could not save backup PIN. Please try again.")
+            }
+            return false
+        }
+        sessionStore.isBiometricAppLockEnabled = true
         sessionStore.recordBiometricUnlockSuccess()
         _uiState.update {
             it.copy(
-                isBiometricLockEnabled = sessionStore.isBiometricAppLockEnabled,
-                isBiometricLockedNow = false
+                isBiometricLockEnabled = true,
+                isBiometricLockedNow = false,
+                hasBackupPin = true,
+                needsBackupPinSetup = false,
+                pinErrorMessage = null,
+                pinLockoutSeconds = 0,
+                bannerMessage = "Biometric App Lock and 4-digit backup PIN enabled"
+            )
+        }
+        return true
+    }
+
+    fun setBiometricAppLockEnabled(enabled: Boolean) {
+        if (!enabled) {
+            sessionStore.clearBackupPinAndBiometricLock()
+            pinLockoutTickerJob?.cancel()
+            _uiState.update {
+                it.copy(
+                    isBiometricLockEnabled = false,
+                    isBiometricLockedNow = false,
+                    hasBackupPin = false,
+                    needsBackupPinSetup = false,
+                    pinErrorMessage = null,
+                    pinLockoutSeconds = 0,
+                    bannerMessage = "App Lock disabled"
+                )
+            }
+            return
+        }
+
+        if (!sessionStore.hasBackupPin()) {
+            // Require setting and confirming a 4-digit backup PIN before completing biometric setup
+            _uiState.update {
+                it.copy(
+                    needsBackupPinSetup = true,
+                    pinErrorMessage = null
+                )
+            }
+            return
+        }
+
+        sessionStore.isBiometricAppLockEnabled = true
+        sessionStore.recordBiometricUnlockSuccess()
+        _uiState.update {
+            it.copy(
+                isBiometricLockEnabled = true,
+                isBiometricLockedNow = false,
+                hasBackupPin = true,
+                needsBackupPinSetup = false,
+                pinErrorMessage = null,
+                bannerMessage = "App Lock enabled (requires biometric or PIN every 30 minutes)"
             )
         }
     }
 
-    fun setBiometricAppLockEnabled(enabled: Boolean) {
-        sessionStore.isBiometricAppLockEnabled = enabled
-        if (enabled) {
-            sessionStore.recordBiometricUnlockSuccess()
-        } else {
-            sessionStore.lastBiometricUnlockMs = 0L
+    /**
+     * Verifies the 4-digit backup PIN locally with Keystore-backed protection and rate-limiting,
+     * and ensures the PocketBase session is valid before unlocking.
+     */
+    fun unlockWithBackupPin(pin: String) {
+        val result = sessionStore.verifyBackupPin(pin)
+        if (result.sessionInvalid) {
+            performLocalSignOutCleanup("Your session ended. Please sign in again.")
+            return
         }
-        _uiState.update {
-            it.copy(
-                isBiometricLockEnabled = enabled,
-                isBiometricLockedNow = false,
-                bannerMessage = if (enabled) {
-                    "App Lock enabled (requires biometric every 30 minutes)"
-                } else {
-                    "App Lock disabled"
+        if (!result.success) {
+            if (result.remainingLockoutSeconds > 0) {
+                _uiState.update {
+                    it.copy(
+                        pinLockoutSeconds = result.remainingLockoutSeconds,
+                        pinErrorMessage = "Too many failed attempts. Try again in ${result.remainingLockoutSeconds}s."
+                    )
                 }
-            )
+                startPinLockoutCountdownTicker()
+            } else {
+                _uiState.update {
+                    it.copy(
+                        pinLockoutSeconds = 0,
+                        pinErrorMessage = "Incorrect 4-digit PIN (${result.attemptsRemaining} attempts remaining)."
+                    )
+                }
+            }
+            return
+        }
+
+        viewModelScope.launch {
+            try {
+                if (!apiClient.validateCurrentSession()) {
+                    performLocalSignOutCleanup("Your session ended on this device. Please sign in again.")
+                    return@launch
+                }
+            } catch (_: Exception) {
+            }
+            pinLockoutTickerJob?.cancel()
+            _uiState.update {
+                it.copy(
+                    isBiometricLockedNow = false,
+                    pinErrorMessage = null,
+                    pinLockoutSeconds = 0
+                )
+            }
+        }
+    }
+
+    fun clearPinError() {
+        _uiState.update { it.copy(pinErrorMessage = null) }
+    }
+
+    /**
+     * Requires account sign-in again to recover a forgotten PIN or restore an expired/revoked session.
+     */
+    fun recoverForgottenPinBySigningOut() {
+        viewModelScope.launch {
+            val pushId = sessionStore.registeredPushDeviceId
+            if (sessionStore.getAuthToken().isNotBlank()) {
+                try {
+                    if (pushId.isNotBlank()) {
+                        apiClient.deletePushDevice(pushId)
+                    }
+                } catch (_: Exception) {
+                }
+                try {
+                    apiClient.logoutSession()
+                } catch (_: Exception) {
+                }
+            }
+            performLocalSignOutCleanup("Sign in with your account password to reset your App Lock PIN.")
+        }
+    }
+
+    private fun startPinLockoutCountdownTicker() {
+        pinLockoutTickerJob?.cancel()
+        pinLockoutTickerJob = viewModelScope.launch {
+            while (true) {
+                val secs = sessionStore.getPinLockoutRemainingSeconds()
+                if (secs <= 0) {
+                    _uiState.update {
+                        it.copy(
+                            pinLockoutSeconds = 0,
+                            pinErrorMessage = null
+                        )
+                    }
+                    break
+                }
+                _uiState.update {
+                    it.copy(
+                        pinLockoutSeconds = secs,
+                        pinErrorMessage = "Too many failed attempts. Try again in ${secs}s."
+                    )
+                }
+                delay(1_000L)
+            }
         }
     }
 
@@ -271,19 +500,15 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             try {
                 val auth = apiClient.signInWithPassword(email, password)
                 sessionStore.saveSession(auth.token, auth.user)
-                val historyLocked = try {
-                    apiClient.fetchSessionStatus()
-                } catch (_: Exception) {
-                    false
-                }
                 _uiState.update {
                     it.copy(
                         isLoading = false,
                         currentUser = auth.user,
-                        historyLocked = historyLocked,
-                        bannerMessage = if (historyLocked) {
-                            "Earlier history is locked on this device until verified by email code."
-                        } else null
+                        isBiometricLockEnabled = sessionStore.isBiometricAppLockEnabled,
+                        isBiometricLockedNow = false,
+                        hasBackupPin = sessionStore.hasBackupPin(),
+                        needsBackupPinSetup = sessionStore.isBiometricAppLockEnabled && !sessionStore.hasBackupPin(),
+                        bannerMessage = null
                     )
                 }
                 realtimeClient.connectIfAuthenticated()
@@ -316,12 +541,14 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             try {
                 val auth = apiClient.registerAccount(name, email, password, passwordConfirm)
                 sessionStore.saveSession(auth.token, auth.user)
-                sessionStore.historyLocked = false
                 _uiState.update {
                     it.copy(
                         isLoading = false,
                         currentUser = auth.user,
-                        historyLocked = false
+                        isBiometricLockEnabled = sessionStore.isBiometricAppLockEnabled,
+                        isBiometricLockedNow = false,
+                        hasBackupPin = sessionStore.hasBackupPin(),
+                        needsBackupPinSetup = sessionStore.isBiometricAppLockEnabled && !sessionStore.hasBackupPin()
                     )
                 }
                 realtimeClient.connectIfAuthenticated()
@@ -330,47 +557,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             } catch (e: Exception) {
                 _uiState.update {
                     it.copy(isLoading = false, errorMessage = e.message ?: "Registration failed.")
-                }
-            }
-        }
-    }
-
-    fun requestHistoryUnlockOtp() {
-        viewModelScope.launch {
-            try {
-                apiClient.requestHistoryUnlockCode()
-                _uiState.update {
-                    it.copy(bannerMessage = "6-digit unlock code sent to your email.")
-                }
-            } catch (e: Exception) {
-                _uiState.update {
-                    it.copy(errorMessage = e.message ?: "Failed to send unlock code.")
-                }
-            }
-        }
-    }
-
-    fun confirmHistoryUnlockOtp(code: String) {
-        if (code.trim().length != 6) {
-            _uiState.update { it.copy(errorMessage = "Enter the 6-digit code from your email.") }
-            return
-        }
-        viewModelScope.launch {
-            _uiState.update { it.copy(isLoading = true, errorMessage = null) }
-            try {
-                apiClient.confirmHistoryUnlockCode(code.trim())
-                val locked = apiClient.fetchSessionStatus()
-                _uiState.update {
-                    it.copy(
-                        isLoading = false,
-                        historyLocked = locked,
-                        bannerMessage = "Earlier chat history unlocked."
-                    )
-                }
-                refreshAllAuthenticatedData()
-            } catch (e: Exception) {
-                _uiState.update {
-                    it.copy(isLoading = false, errorMessage = e.message ?: "Invalid or expired code.")
                 }
             }
         }
@@ -534,32 +720,46 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private fun performLocalSignOutCleanup(reasonBanner: String?) {
+    /**
+     * Clears local credentials and private cached data, stops any active call and the realtime SSE
+     * connection, cancels notifications, and returns to the Sign-In state.
+     */
+    fun performLocalSignOutCleanup(reasonBanner: String?) {
         presenceTickerJob?.cancel()
         typingStopDebounceJob?.cancel()
+        pinLockoutTickerJob?.cancel()
+        voiceRecordTickerJob?.cancel()
+        stopAudioPlayback()
         realtimeClient.disconnect()
         callCoordinator.declineOrHangUpCall()
+        SystemNotificationAndFcmManager.cancelAllNotifications(getApplication())
         apiClient.clearCachedFileToken()
         sessionStore.clearAuthSession()
+        pendingRetryAttachments.values.forEach { (file, _) ->
+            try {
+                file.delete()
+            } catch (_: Exception) {
+            }
+        }
         pendingRetryAttachments.clear()
         _uiState.update {
             AppUiState(
                 isInitialized = true,
-                isBiometricLockEnabled = sessionStore.isBiometricAppLockEnabled,
                 bannerMessage = reasonBanner
             )
         }
     }
 
     /**
-     * Only signs out the user if a 401 is confirmed by `/api/app/account/session` to be a genuine
-     * session revocation. Never logs out the user on file token errors or 404 protected records.
+     * Validates the current session against `GET /api/app/account/session` when a 401 occurs.
+     * If the server confirms that the session ended, clears local credentials and private cached
+     * data, stops the call and realtime connection, and returns to sign-in.
      */
     private suspend fun handleApiFailure(e: Exception, defaultMsg: String) {
-        if (e is ApiException && e.statusCode == 401) {
+        if (e is ApiException && (e.statusCode == 401 || e.statusCode == 403)) {
             val revoked = apiClient.isSessionTrulyRevoked()
             if (revoked) {
-                performLocalSignOutCleanup("Session was signed out from another device.")
+                performLocalSignOutCleanup("Your session ended on this device. Please sign in again.")
                 return
             }
         }
@@ -616,11 +816,11 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         val ownUser = _uiState.value.currentUser ?: return
         viewModelScope.launch {
             try {
-                val historyLockedDeferred = async(Dispatchers.IO) {
+                val sessionValidDeferred = async(Dispatchers.IO) {
                     try {
-                        apiClient.fetchSessionStatus()
+                        apiClient.validateCurrentSession()
                     } catch (_: Exception) {
-                        sessionStore.historyLocked
+                        true
                     }
                 }
                 val inboxDeferred = async(Dispatchers.IO) { apiClient.fetchInbox() }
@@ -632,7 +832,11 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }
 
-                val historyLocked = historyLockedDeferred.await()
+                if (!sessionValidDeferred.await()) {
+                    performLocalSignOutCleanup("Your session ended on this device. Please sign in again.")
+                    return@launch
+                }
+
                 val inbox = inboxDeferred.await()
                 val allMembers = membersDeferred.await()
                 val membersMap = allMembers.groupBy { it.conversation }
@@ -640,7 +844,6 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 // Show inbox list immediately so UI never feels frozen
                 _uiState.update {
                     it.copy(
-                        historyLocked = historyLocked,
                         chats = inbox.chats,
                         requests = inbox.requests,
                         membersByConversation = membersMap
@@ -648,15 +851,11 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 recomputeChatsSummary()
 
-                // Fetch messages and calls concurrently on IO
+                // Fetch existing chat history and recent calls normally after sign-in
                 val callsDeferred = async(Dispatchers.IO) {
-                    if (!historyLocked) {
-                        try {
-                            apiClient.fetchRecentCalls()
-                        } catch (_: Exception) {
-                            emptyList()
-                        }
-                    } else {
+                    try {
+                        apiClient.fetchRecentCalls()
+                    } catch (_: Exception) {
                         emptyList()
                     }
                 }
@@ -1374,28 +1573,36 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     fun startVoiceNoteRecording() {
         if (_uiState.value.isRecordingVoiceNote) return
+        stopAudioPlayback()
         val outFile = File(getApplication<Application>().cacheDir, "voice_${System.currentTimeMillis()}.m4a")
         activeVoiceOutputFile = outFile
         viewModelScope.launch(Dispatchers.IO) {
-            try {
-                val recorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                    MediaRecorder(getApplication())
-                } else {
-                    @Suppress("DEPRECATION")
-                    MediaRecorder()
+            voiceRecorderMutex.withLock {
+                try {
+                    mediaRecorder?.release()
+                } catch (_: Exception) {
                 }
-                recorder.setAudioSource(MediaRecorder.AudioSource.MIC)
-                recorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-                recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
-                recorder.setAudioEncodingBitRate(64_000)
-                recorder.setAudioSamplingRate(44_100)
-                recorder.setOutputFile(outFile.absolutePath)
-                recorder.prepare()
-                recorder.start()
-                mediaRecorder = recorder
-            } catch (_: Exception) {
                 mediaRecorder = null
-                outFile.writeBytes(MINIMAL_M4A_HEADER)
+                try {
+                    val recorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                        MediaRecorder(getApplication())
+                    } else {
+                        @Suppress("DEPRECATION")
+                        MediaRecorder()
+                    }
+                    recorder.setAudioSource(MediaRecorder.AudioSource.MIC)
+                    recorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+                    recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+                    recorder.setAudioEncodingBitRate(64_000)
+                    recorder.setAudioSamplingRate(44_100)
+                    recorder.setOutputFile(outFile.absolutePath)
+                    recorder.prepare()
+                    recorder.start()
+                    mediaRecorder = recorder
+                } catch (_: Exception) {
+                    mediaRecorder = null
+                    outFile.writeBytes(MINIMAL_M4A_HEADER)
+                }
             }
         }
 
@@ -1419,15 +1626,17 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update { it.copy(isRecordingVoiceNote = false, recordingElapsedSeconds = 0) }
 
         viewModelScope.launch(Dispatchers.IO) {
-            try {
-                mediaRecorder?.stop()
-            } catch (_: Exception) {
+            voiceRecorderMutex.withLock {
+                try {
+                    mediaRecorder?.stop()
+                } catch (_: Exception) {
+                }
+                try {
+                    mediaRecorder?.release()
+                } catch (_: Exception) {
+                }
+                mediaRecorder = null
             }
-            try {
-                mediaRecorder?.release()
-            } catch (_: Exception) {
-            }
-            mediaRecorder = null
 
             if (cancel || file == null) {
                 file?.delete()
@@ -1458,30 +1667,52 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update { it.copy(playingAudioMessageId = message.id) }
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                val urlOrPath = if (message.localAttachmentUri.isNotBlank() &&
-                    File(message.localAttachmentUri).exists()
+                val localFile = if (message.localAttachmentUri.isNotBlank() &&
+                    File(message.localAttachmentUri).exists() &&
+                    File(message.localAttachmentUri).length() > 0L
                 ) {
-                    message.localAttachmentUri
+                    File(message.localAttachmentUri)
                 } else {
-                    apiClient.buildProtectedFileUrl(
+                    apiClient.downloadProtectedFileToCache(
                         collection = "messages",
                         recordId = message.id,
                         filename = message.attachment,
-                        forceRefreshToken = false
+                        cacheDir = getApplication<Application>().cacheDir
                     )
                 }
-                if (urlOrPath.isBlank()) {
-                    delay(1_500L)
+
+                if (localFile == null || !localFile.exists() || localFile.length() == 0L) {
+                    delay(1_200L)
                     _uiState.update { it.copy(playingAudioMessageId = null) }
                     return@launch
                 }
+
                 val player = MediaPlayer()
                 mediaPlayer = player
-                player.setDataSource(urlOrPath)
+                player.setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .build()
+                )
                 player.setOnCompletionListener {
+                    try {
+                        it.release()
+                    } catch (_: Exception) {
+                    }
+                    if (mediaPlayer === it) {
+                        mediaPlayer = null
+                    }
                     _uiState.update { state -> state.copy(playingAudioMessageId = null) }
                 }
-                player.setOnErrorListener { _, _, _ ->
+                player.setOnErrorListener { mp, _, _ ->
+                    try {
+                        mp.release()
+                    } catch (_: Exception) {
+                    }
+                    if (mediaPlayer === mp) {
+                        mediaPlayer = null
+                    }
                     viewModelScope.launch(Dispatchers.IO) {
                         try {
                             apiClient.getFileToken(forceRefresh = true)
@@ -1491,8 +1722,20 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     }
                     true
                 }
+                player.setOnPreparedListener { mp ->
+                    if (_uiState.value.playingAudioMessageId == message.id) {
+                        mp.start()
+                    } else {
+                        try {
+                            mp.release()
+                        } catch (_: Exception) {
+                        }
+                    }
+                }
+                FileInputStream(localFile).use { fis ->
+                    player.setDataSource(fis.fd)
+                }
                 player.prepareAsync()
-                player.setOnPreparedListener { it.start() }
             } catch (_: Exception) {
                 delay(1_200L)
                 _uiState.update { it.copy(playingAudioMessageId = null) }
@@ -1501,18 +1744,21 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun stopAudioPlayback() {
-        viewModelScope.launch(Dispatchers.IO) {
-            try {
-                mediaPlayer?.stop()
-            } catch (_: Exception) {
-            }
-            try {
-                mediaPlayer?.release()
-            } catch (_: Exception) {
-            }
-            mediaPlayer = null
-        }
+        val playerToStop = mediaPlayer
+        mediaPlayer = null
         _uiState.update { it.copy(playingAudioMessageId = null) }
+        if (playerToStop != null) {
+            viewModelScope.launch(Dispatchers.IO) {
+                try {
+                    playerToStop.stop()
+                } catch (_: Exception) {
+                }
+                try {
+                    playerToStop.release()
+                } catch (_: Exception) {
+                }
+            }
+        }
     }
 
     // ---------------- Member Search & Message Requests ----------------

@@ -100,12 +100,26 @@ class PocketBaseApiClient(
             put("password", password)
             put("passwordConfirm", passwordConfirm)
         }
+        val bodyStr = payload.toString()
         val req = Request.Builder()
             .url("$baseUrl/api/app/account/register")
             .header("X-App-Device", sessionStore.deviceId)
-            .post(payload.toString().toRequestBody(JSON_MEDIA))
+            .post(bodyStr.toRequestBody(JSON_MEDIA))
             .build()
-        executeJson(req, isAuthCheck = false).let { parseAuthResponse(it) }
+        try {
+            executeJson(req, isAuthCheck = false).let { parseAuthResponse(it) }
+        } catch (e: ApiException) {
+            if (e.statusCode == 404) {
+                val fallbackReq = Request.Builder()
+                    .url("$baseUrl/api/app/signup")
+                    .header("X-App-Device", sessionStore.deviceId)
+                    .post(bodyStr.toRequestBody(JSON_MEDIA))
+                    .build()
+                executeJson(fallbackReq, isAuthCheck = false).let { parseAuthResponse(it) }
+            } else {
+                throw e
+            }
+        }
     }
 
     suspend fun signInWithPassword(
@@ -131,53 +145,53 @@ class PocketBaseApiClient(
         executeJson(req, isAuthCheck = true).let { parseAuthResponse(it) }
     }
 
-    suspend fun fetchSessionStatus(): Boolean = withContext(Dispatchers.IO) {
+    /**
+     * Validates the current session against `GET /api/app/account/session` with `Authorization`
+     * and `X-App-Device`.
+     * Returns `true` if the session is valid, `false` if the server confirms that the session ended
+     * (e.g. HTTP 401/403 or `active=false`/`valid=false`/`sessionEnded=true`).
+     */
+    suspend fun validateCurrentSession(): Boolean = withContext(Dispatchers.IO) {
+        val token = sessionStore.getAuthToken()
+        if (token.isBlank()) return@withContext false
         val req = authenticatedBuilder("/api/app/account/session")
             .get()
             .build()
-        val json = executeJson(req, isAuthCheck = true)
-        val locked = json.optBoolean("historyLocked", false)
-        sessionStore.historyLocked = locked
-        locked
+        httpClient.newCall(req).execute().use { resp ->
+            if (resp.code == 401 || resp.code == 403) {
+                return@withContext false
+            }
+            val raw = resp.body?.string().orEmpty()
+            if (!resp.isSuccessful) {
+                throw parseApiError(resp.code, raw, isAuthCheck = true)
+            }
+            if (raw.isNotBlank()) {
+                val json = JSONObject(raw)
+                if (json.has("active") && !json.optBoolean("active", true)) return@withContext false
+                if (json.has("valid") && !json.optBoolean("valid", true)) return@withContext false
+                if (json.has("authenticated") && !json.optBoolean("authenticated", true)) return@withContext false
+                if (json.optBoolean("sessionEnded", false)) return@withContext false
+            }
+            true
+        }
     }
 
     /**
      * Verifies whether a 401/error from a normal or file route actually means the user's session
-     * was revoked on the server. Only returns `true` when `/api/app/account/session` returns 401.
+     * was ended on the server (e.g., evicted by a 3rd device or revoked).
+     * Only returns `true` when `GET /api/app/account/session` confirms the session has ended.
      */
     suspend fun isSessionTrulyRevoked(): Boolean = withContext(Dispatchers.IO) {
         val token = sessionStore.getAuthToken()
         if (token.isBlank()) return@withContext true
         try {
-            val req = Request.Builder()
-                .url("$baseUrl/api/app/account/session")
-                .header("Authorization", token)
-                .get()
-                .build()
-            httpClient.newCall(req).execute().use { resp ->
-                resp.code == 401
-            }
+            !validateCurrentSession()
         } catch (_: Exception) {
             false
         }
     }
 
-    // ---------------- History Unlock, Recovery & Account Changes ----------------
-
-    suspend fun requestHistoryUnlockCode() = withContext(Dispatchers.IO) {
-        val req = authenticatedBuilder("/api/app/account/history/request")
-            .post("{}".toRequestBody(JSON_MEDIA))
-            .build()
-        executeNoContent(req)
-    }
-
-    suspend fun confirmHistoryUnlockCode(code: String) = withContext(Dispatchers.IO) {
-        val payload = JSONObject().put("code", code.trim())
-        val req = authenticatedBuilder("/api/app/account/history/confirm")
-            .post(payload.toString().toRequestBody(JSON_MEDIA))
-            .build()
-        executeNoContent(req)
-    }
+    // ---------------- Password Recovery & Account Changes ----------------
 
     suspend fun requestRecoveryCode(email: String) = withContext(Dispatchers.IO) {
         val payload = JSONObject().put("email", email.trim())
@@ -341,6 +355,61 @@ class PocketBaseApiClient(
             sb.append("?").append(params.joinToString("&"))
         }
         return sb.toString()
+    }
+
+    /**
+     * Downloads a protected file attachment (such as a voice note in `audio/mp4`, `audio/webm`, or `audio/ogg`)
+     * into `cacheDir` using `httpClient`, retrying once with a refreshed file token on 401/403/404.
+     */
+    suspend fun downloadProtectedFileToCache(
+        collection: String,
+        recordId: String,
+        filename: String,
+        cacheDir: File
+    ): File? = withContext(Dispatchers.IO) {
+        if (recordId.isBlank() || filename.isBlank()) return@withContext null
+        val sanitizedName = filename.replace(Regex("[^a-zA-Z0-9._-]"), "_")
+        val targetFile = File(cacheDir, "media_${recordId}_$sanitizedName")
+        if (targetFile.exists() && targetFile.length() > 0L) {
+            return@withContext targetFile
+        }
+
+        for (attempt in 0..1) {
+            val url = buildProtectedFileUrl(
+                collection = collection,
+                recordId = recordId,
+                filename = filename,
+                forceRefreshToken = attempt > 0
+            )
+            if (url.isBlank()) continue
+            val req = Request.Builder().url(url).get().build()
+            try {
+                httpClient.newCall(req).execute().use { resp ->
+                    if (resp.isSuccessful) {
+                        val body = resp.body ?: return@use
+                        val tempFile = File(cacheDir, "${targetFile.name}.tmp_${System.nanoTime()}")
+                        body.byteStream().use { input ->
+                            tempFile.outputStream().use { output ->
+                                input.copyTo(output)
+                            }
+                        }
+                        if (tempFile.length() > 0L) {
+                            if (!tempFile.renameTo(targetFile)) {
+                                tempFile.copyTo(targetFile, overwrite = true)
+                                tempFile.delete()
+                            }
+                            return@withContext targetFile
+                        } else {
+                            tempFile.delete()
+                        }
+                    } else if (resp.code == 401 || resp.code == 403 || resp.code == 404) {
+                        clearCachedFileToken()
+                    }
+                }
+            } catch (_: Exception) {
+            }
+        }
+        null
     }
 
     // ---------------- Inbox, Search & Message Requests ----------------
@@ -767,7 +836,9 @@ class PocketBaseApiClient(
 
     private fun authenticatedBuilder(path: String): Request.Builder {
         val fullUrl = if (path.startsWith("http")) path else "$baseUrl$path"
-        val builder = Request.Builder().url(fullUrl)
+        val builder = Request.Builder()
+            .url(fullUrl)
+            .header("X-App-Device", sessionStore.deviceId)
         val token = sessionStore.getAuthToken()
         if (token.isNotBlank()) {
             builder.header("Authorization", token)
