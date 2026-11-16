@@ -497,21 +497,19 @@ class PocketBaseApiClient(
                 .post(payload.toString().toRequestBody(JSON_MEDIA))
                 .build()
             val json = executeJson(req, isAuthCheck = false)
-            val convObj = json.optJSONObject("conversation")
-            if (convObj != null) {
-                return@withContext MessageRequestResult(
-                    existingConversationId = convObj.optString("id")
-                )
+            val conversationId = responseRecordId(json, "conversation")
+            if (conversationId.isNotBlank()) {
+                return@withContext MessageRequestResult(existingConversationId = conversationId)
             }
             val reqObj = json.optJSONObject("request")
             val direction = json.optString("direction", "outgoing")
-            val parsedReq = reqObj?.let {
+            val parsedReq = responseRecordId(json, "request").takeIf { it.isNotBlank() }?.let { id ->
                 MessageRequestItem(
-                    id = it.optString("id"),
+                    id = id,
                     peer = PeerSummary(id = recipientId, name = ""),
                     incoming = direction == "incoming",
-                    note = it.optString("note", note),
-                    created = it.optString("created")
+                    note = reqObj?.optString("note", note) ?: note,
+                    created = reqObj?.optString("created").orEmpty()
                 )
             }
             MessageRequestResult(request = parsedReq, direction = direction)
@@ -522,8 +520,15 @@ class PocketBaseApiClient(
             .post("{}".toRequestBody(JSON_MEDIA))
             .build()
         val json = executeJson(req, isAuthCheck = false)
-        json.optJSONObject("conversation")?.optString("id").orEmpty()
+        responseRecordId(json, "conversation")
     }
+
+    private fun responseRecordId(json: JSONObject, key: String): String =
+        when (val record = json.opt(key)) {
+            is String -> record
+            is JSONObject -> record.optString("id")
+            else -> ""
+        }
 
     suspend fun deleteMessageRequest(requestId: String) = withContext(Dispatchers.IO) {
         val req = authenticatedBuilder("/api/app/message-requests/$requestId")
