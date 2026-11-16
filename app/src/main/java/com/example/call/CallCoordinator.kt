@@ -347,6 +347,10 @@ class CallCoordinator(
 
                 if (current.callId != record.id) return@withLock
 
+                if (record.secureBy.isNotBlank() && current.isScreenSharing) {
+                    setScreenSharing(false)
+                }
+
                 _uiState.update {
                     it.copy(
                         conversationId = record.conversation.ifBlank { it.conversationId },
@@ -934,6 +938,10 @@ class CallCoordinator(
     }
 
     fun setScreenSharing(enabled: Boolean, mediaProjectionPermissionResultData: android.content.Intent? = null) {
+        if (enabled && _uiState.value.secureBy.isNotBlank()) {
+            _uiState.update { it.copy(statusBannerText = "Turn off secure mode to share the screen.") }
+            return
+        }
         val room = activeLiveKitRoom ?: return
         scope.launch {
             try {
