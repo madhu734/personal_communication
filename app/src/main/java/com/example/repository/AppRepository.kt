@@ -143,6 +143,7 @@ class AppViewModel internal constructor(
     // Tracks failed outgoing attachment files by clientMessageId for idempotent retry
     private val pendingRetryAttachments = mutableMapOf<String, Pair<File, String>>()
     private val pendingMessageStore by lazy { PendingMessageStore(getApplication()) }
+    private val sendingMessageIds = mutableSetOf<String>()
 
     // Monotonic delete/hide tracking so stale HTTP responses or SSE events never restore deleted content
     private val deleteStateLock = Any()
@@ -182,6 +183,7 @@ class AppViewModel internal constructor(
             realtimeClient.onReconnected.collect {
                 if (_uiState.value.currentUser != null) {
                     refreshAllAuthenticatedData()
+                    retryPendingMessages()
                 }
             }
         }
@@ -1707,6 +1709,11 @@ class AppViewModel internal constructor(
         }
     }
 
+    private fun retryPendingMessages() {
+        val user = _uiState.value.currentUser ?: return
+        pendingMessageStore.list(user.id).forEach { retryFailedMessage(it.message) }
+    }
+
     fun retryFailedMessage(message: ChatMessage) {
         val filePair = pendingRetryAttachments[message.clientMessageId]
         enqueueAndSendMessage(
@@ -1735,6 +1742,7 @@ class AppViewModel internal constructor(
     ) {
         val ownUser = _uiState.value.currentUser ?: return
         val clientMsgId = existingClientMessageId ?: UUID.randomUUID().toString()
+        if (!sendingMessageIds.add(clientMsgId)) return
         val nowIso = Instant.now().toString()
         val optimistic = ChatMessage(
             id = "local_$clientMsgId",
@@ -1756,6 +1764,7 @@ class AppViewModel internal constructor(
         val pending = try {
             pendingMessageStore.save(ownUser.id, optimistic, attachmentFile, attachmentMimeType)
         } catch (e: Exception) {
+            sendingMessageIds.remove(clientMsgId)
             _uiState.update { it.copy(errorMessage = "Could not save the message for retry.") }
             return
         }
@@ -1800,6 +1809,8 @@ class AppViewModel internal constructor(
                     replacement = optimistic.copy(deliveryState = MessageDeliveryState.FAILED)
                 )
                 handleApiFailure(e, "Message failed to send. Tap Retry on the message bubble.")
+            } finally {
+                sendingMessageIds.remove(clientMsgId)
             }
         }
     }
