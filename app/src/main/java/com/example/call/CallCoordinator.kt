@@ -746,7 +746,7 @@ class CallCoordinator(
 
             if (hasMicPerm && hasAudioInputHardware && _uiState.value.isMicEnabled) {
                 try {
-                    check(room.localParticipant.setMicrophoneEnabled(true)) { "Microphone could not start" }
+                    setMicrophoneEnabled(room, true)
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
@@ -763,7 +763,7 @@ class CallCoordinator(
                 !_uiState.value.videoQuality.audioOnly
             ) {
                 try {
-                    check(room.localParticipant.setCameraEnabled(true)) { "Camera could not start" }
+                    setCameraEnabled(room, true)
                     updateLocalVideoTrackRef(room)
                 } catch (e: CancellationException) {
                     throw e
@@ -796,6 +796,23 @@ class CallCoordinator(
         }
     }
 
+    private suspend fun setMicrophoneEnabled(room: Room, enabled: Boolean) {
+        room.localParticipant.setMicrophoneEnabled(enabled)
+        checkMediaPublication(room, Track.Source.MICROPHONE, enabled)
+    }
+
+    private suspend fun setCameraEnabled(room: Room, enabled: Boolean) {
+        room.localParticipant.setCameraEnabled(enabled)
+        checkMediaPublication(room, Track.Source.CAMERA, enabled)
+    }
+
+    private fun checkMediaPublication(room: Room, source: Track.Source, enabled: Boolean) {
+        val publication = room.localParticipant.getTrackPublication(source)
+        check((publication?.track != null && !publication.muted) == enabled) {
+            "Could not change ${source.name.lowercase()}"
+        }
+    }
+
     private fun updateRemoteVideoTrack(room: Room) {
         if (activeLiveKitRoom !== room) return
         _remoteVideoTrack.value = room.remoteParticipants.values
@@ -825,7 +842,7 @@ class CallCoordinator(
         scope.launch {
             try {
                 room.setMicrophoneMute(false)
-                check(room.localParticipant.setMicrophoneEnabled(true))
+                setMicrophoneEnabled(room, true)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -842,7 +859,7 @@ class CallCoordinator(
             try {
                 if (room != null) {
                     room.setMicrophoneMute(!next)
-                    check(room.localParticipant.setMicrophoneEnabled(next))
+                    setMicrophoneEnabled(room, next)
                 }
             } catch (e: CancellationException) {
                 throw e
@@ -865,7 +882,7 @@ class CallCoordinator(
         scope.launch {
             try {
                 CallForegroundService.start(appContext, next)
-                check(room.localParticipant.setCameraEnabled(next))
+                setCameraEnabled(room, next)
                 updateLocalVideoTrackRef(room)
                 if (next && _uiState.value.videoQuality.audioOnly) {
                     _uiState.update { it.copy(videoQuality = VideoQualityPreset.AUTO_720P) }
@@ -897,7 +914,7 @@ class CallCoordinator(
         scope.launch {
             try {
                 if (preset.audioOnly) {
-                    check(room.localParticipant.setCameraEnabled(false))
+                    setCameraEnabled(room, false)
                 } else {
                     val track = _localVideoTrack.value
                     if (track != null) {
