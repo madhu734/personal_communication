@@ -22,7 +22,9 @@ import com.example.model.WatermarkCursorUtils
 import com.example.network.ApiException
 import com.example.network.PocketBaseApiClient
 import com.example.storage.SessionAndMuteStore
+import io.livekit.android.ConnectOptions
 import io.livekit.android.LiveKit
+import io.livekit.android.util.flow
 import io.livekit.android.audio.AudioSwitchHandler
 import com.twilio.audioswitch.AudioDevice
 import kotlinx.coroutines.CancellationException
@@ -40,6 +42,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -47,7 +50,9 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.withContext
+import livekit.org.webrtc.PeerConnection
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
@@ -454,6 +459,7 @@ class CallCoordinator(
                         throw e
                     }
                 }
+                if (_uiState.value.callId != callId || _uiState.value.phase == CallPhase.ENDED) return@launch
                 CallForegroundService.start(appContext, accepted.kind == CallKind.VIDEO)
                 if (roomJoinedCallIds.add(callId)) {
                     connectToLiveKitRoom(callId)
@@ -660,7 +666,7 @@ class CallCoordinator(
                         is RoomEvent.TrackMuted, is RoomEvent.TrackUnmuted -> updateRemoteVideoTrack(room)
 
                         is RoomEvent.Reconnecting -> {
-                            if (_uiState.value.callId == callId) {
+                            if (_uiState.value.callId == callId && _uiState.value.phase == CallPhase.ACTIVE) {
                                 _uiState.update {
                                     it.copy(
                                         phase = CallPhase.RECONNECTING,
@@ -696,34 +702,24 @@ class CallCoordinator(
                 }
             }
 
-            // Connect with up to 3 attempts so transient ICE / WebSocket hiccups recover automatically
-            var connectException: Exception? = null
-            var activeUrl = wsUrl
-            var activeToken = jwtToken
-            for (attempt in 0..2) {
-                if (_uiState.value.callId != callId || _uiState.value.phase == CallPhase.ENDED) {
-                    return
+            val mediaConnected = withTimeoutOrNull(10_000L) {
+                room.connect(url = wsUrl, token = jwtToken)
+                room::state.flow.first { it == Room.State.CONNECTED }
+                true
+            } ?: false
+            if (!mediaConnected) {
+                room.disconnect()
+                _uiState.update { it.copy(statusBannerText = "Connecting through relay...") }
+                val grant = apiClient.fetchCallToken(callId)
+                val relay = PeerConnection.RTCConfiguration(emptyList()).apply {
+                    iceTransportsType = PeerConnection.IceTransportsType.RELAY
                 }
-                try {
-                    if (attempt > 0) {
-                        val refreshedGrant = apiClient.fetchCallToken(callId)
-                        activeUrl = refreshedGrant.wsUrl
-                        activeToken = refreshedGrant.token
-                    }
-                    withContext(Dispatchers.IO) {
-                        room.connect(url = activeUrl, token = activeToken)
-                    }
-                    connectException = null
-                    break
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    connectException = e
-                    if (attempt < 2) delay(700L)
-                }
-            }
-            if (connectException != null) {
-                throw connectException
+                val relayed = withTimeoutOrNull(15_000L) {
+                    room.connect(url = grant.wsUrl, token = grant.token, options = ConnectOptions(rtcConfig = relay))
+                    room::state.flow.first { it == Room.State.CONNECTED }
+                    true
+                } ?: false
+                check(relayed) { "Could not connect call audio or video. Try another network." }
             }
 
             try {

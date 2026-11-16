@@ -43,7 +43,7 @@ googleid = "1.1.1"
 browser = "1.8.0"
 coreTelecom = "1.0.0-rc01"
 biometric = "1.1.0"
-livekit = "2.10.0"
+livekit = "2.30.0"
 
 
 [libraries]
