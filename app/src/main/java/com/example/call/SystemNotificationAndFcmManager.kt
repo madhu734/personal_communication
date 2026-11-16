@@ -487,8 +487,9 @@ class ApunKaMessagingService : FirebaseMessagingService() {
         val store = SessionAndMuteStore(applicationContext)
         store.pendingFcmToken = token
         if (store.getAuthToken().isNotBlank()) {
-            serviceScope.launch {
-                try {
+            runBlocking {
+                withTimeoutOrNull(20_000L) {
+                  try {
                     val api = PocketBaseApiClient(store)
                     val oldId = store.registeredPushDeviceId
                     val newId = api.registerAndroidPushDevice(token)
@@ -496,7 +497,8 @@ class ApunKaMessagingService : FirebaseMessagingService() {
                         api.deletePushDevice(oldId)
                     }
                     store.pendingFcmToken = ""
-                } catch (_: Exception) {
+                  } catch (_: Exception) {
+                  }
                 }
             }
         }
