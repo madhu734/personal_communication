@@ -30,7 +30,7 @@ jobs:
         run: |
           if [ -n "$FIREBASE_CLIENT_CONFIG" ]; then
             echo "$FIREBASE_CLIENT_CONFIG" | base64 -d > /tmp/firebase-client.json
-            python3 -c 'import json; p="/tmp/firebase-client.json"; d=json.load(open(p)); c=next(x for x in d["client"] if x["client_info"]["android_client_info"]["package_name"]=="me.tmadhu.mandychat"); c["client_info"]["android_client_info"]["package_name"]="me.tmadhu.mandychat.calltest"; json.dump(d,open("app/google-services.json","w"))'
+            python3 -c 'import copy,json; p="/tmp/firebase-client.json"; d=json.load(open(p)); c=copy.deepcopy(next(x for x in d["client"] if x["client_info"]["android_client_info"]["package_name"]=="me.tmadhu.mandychat")); c["client_info"]["android_client_info"]["package_name"]="me.tmadhu.mandychat.calltest"; d["client"].append(c); json.dump(d,open("app/google-services.json","w"))'
           fi
       - name: Build phone-test APK
         run: gradle :app:assembleDebug -PsideBySideInstall --no-daemon --max-workers=2 -Dorg.gradle.jvmargs='-Xmx3g -Dfile.encoding=UTF-8'
