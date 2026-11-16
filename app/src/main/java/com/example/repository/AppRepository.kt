@@ -11,6 +11,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.call.CallCoordinator
 import com.example.call.SystemNotificationAndFcmManager
+import com.example.model.CallPhase
 import com.example.model.CallRecord
 import com.example.model.ChatMessage
 import com.example.model.ChatSummary
@@ -125,6 +126,8 @@ class AppViewModel internal constructor(
     )
     val uiState: StateFlow<AppUiState> = _uiState.asStateFlow()
 
+    @Volatile
+    private var appInForeground = false
     private var presenceTickerJob: Job? = null
     private var presenceExpiryWatcherJob: Job? = null
     private var typingStopDebounceJob: Job? = null
@@ -1222,10 +1225,30 @@ class AppViewModel internal constructor(
         }
     }
 
+    fun setAppInForeground(visible: Boolean) {
+        appInForeground = visible
+        val conversationId = _uiState.value.selectedConversationId ?: return
+        if (visible) {
+            viewModelScope.launch {
+                markOpenConversationReadIfNeeded(conversationId, _uiState.value.messagesByConversation[conversationId].orEmpty())
+            }
+        }
+    }
+
+    private fun canReadConversation(conversationId: String): Boolean {
+        val state = _uiState.value
+        val call = callCoordinator.uiState.value
+        val chatVisible = call.phase == CallPhase.IDLE || call.phase == CallPhase.ENDED ||
+            call.isMinimizedInApp || call.showInCallChatSheet
+        return appInForeground && !state.isBiometricLockedNow && !call.isInPipMode &&
+            chatVisible && state.selectedConversationId == conversationId
+    }
+
     private suspend fun markOpenConversationReadIfNeeded(
         conversationId: String,
         messages: List<ChatMessage>
     ) {
+        if (!canReadConversation(conversationId)) return
         val ownUser = _uiState.value.currentUser ?: return
         val newestPeerMsg = messages.lastOrNull { it.sender != ownUser.id && !it.id.startsWith("local_") }
             ?: return
@@ -1389,7 +1412,7 @@ class AppViewModel internal constructor(
                             apiClient.markConversationDelivered(convId, resolvedMsg.id)
                         } catch (_: Exception) {
                         }
-                        if (_uiState.value.selectedConversationId == convId) {
+                        if (canReadConversation(convId)) {
                             markOpenConversationReadIfNeeded(convId, merged)
                         } else {
                             val peerName = _uiState.value.chats.firstOrNull { it.id == convId }?.peer?.name
@@ -1523,7 +1546,9 @@ class AppViewModel internal constructor(
             presenceTickerJob = viewModelScope.launch(Dispatchers.IO) {
                 while (_uiState.value.selectedConversationId == conversationId) {
                     try {
-                        apiClient.sendPresence(conversationId, isTyping = false)
+                        if (canReadConversation(conversationId)) {
+                            apiClient.sendPresence(conversationId, isTyping = false)
+                        }
                     } catch (_: Exception) {
                     }
                     delay(30_000L)

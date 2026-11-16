@@ -139,7 +139,7 @@ class MainActivity : FragmentActivity() {
 
                 // If the Activity is currently in OS Picture-in-Picture mode, show only the clean remote video surface
                 if (callState.isInPipMode && callState.phase != CallPhase.IDLE) {
-                    OsPipCallSurface(callState = callState)
+                    OsPipCallSurface(callState = callState, viewModel = viewModel)
                 } else {
                     ApunKaRootContent(
                         uiState = uiState,
@@ -155,6 +155,12 @@ class MainActivity : FragmentActivity() {
     override fun onResume() {
         super.onResume()
         viewModel.checkBiometricLockStateOnResume()
+        viewModel.setAppInForeground(true)
+    }
+
+    override fun onPause() {
+        viewModel.setAppInForeground(false)
+        super.onPause()
     }
 
     override fun onNewIntent(intent: Intent) {

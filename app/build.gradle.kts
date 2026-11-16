@@ -16,8 +16,8 @@ android {
     applicationId = "me.tmadhu.mandychat"
     minSdk = 26
     targetSdk = 36
-    versionCode = 1
-    versionName = "1.0.0"
+    versionCode = System.getenv("GITHUB_RUN_NUMBER")?.toInt()?.plus(1000) ?: 1
+    versionName = System.getenv("GITHUB_RUN_NUMBER")?.let { "1.0.$it" } ?: "1.0.0"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }
@@ -50,6 +50,9 @@ android {
       signingConfig = signingConfigs.getByName("release")
     }
     debug {
+      if (providers.gradleProperty("sideBySideInstall").isPresent) {
+        applicationIdSuffix = ".calltest"
+      }
       // Do not remove or modify this signingConfig assignment. It is necessary for Android apps in
       // AI Studio.
       signingConfig = signingConfigs.getByName("debugConfig")
