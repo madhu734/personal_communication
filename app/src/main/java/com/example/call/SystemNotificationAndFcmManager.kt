@@ -43,6 +43,7 @@ import com.example.MainActivity
 import com.example.R
 import com.example.model.ActiveCallUiState
 import com.example.model.CallKind
+import com.example.model.CallPhase
 import com.example.model.MessageKind
 import com.example.model.MuteDurationOption
 import com.example.model.WatermarkCursorUtils
@@ -55,6 +56,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeoutOrNull
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
@@ -518,6 +521,16 @@ class ApunKaMessagingService : FirebaseMessagingService() {
         }
 
         when (event) {
+            "call_ended" -> {
+                val coordinator = SystemNotificationAndFcmManager.activeCallCoordinator
+                if (coordinator != null && coordinator.uiState.value.callId == id) {
+                    coordinator.onRemoteCallEnded(id)
+                } else if (coordinator == null || coordinator.uiState.value.phase == CallPhase.IDLE ||
+                    coordinator.uiState.value.phase == CallPhase.ENDED) {
+                    CallForegroundService.stop(applicationContext)
+                    SystemNotificationAndFcmManager.cancelCallNotification(applicationContext)
+                }
+            }
             "incoming_call" -> {
                 try {
                     val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager
@@ -538,14 +551,12 @@ class ApunKaMessagingService : FirebaseMessagingService() {
 
             "new_message" -> {
                 val conversationId = id
-                if (store.isConversationMuted(user.id, conversationId)) {
-                    // Conversation is muted; still sync & acknowledge delivery in background without ringing notification
-                    serviceScope.launch {
-                        syncAndAcknowledgePushMessages(store, conversationId, showNotification = false)
-                    }
-                } else {
-                    serviceScope.launch {
-                        syncAndAcknowledgePushMessages(store, conversationId, showNotification = true)
+                runBlocking {
+                    withTimeoutOrNull(20_000L) {
+                        syncAndAcknowledgePushMessages(
+                            store, conversationId,
+                            showNotification = !store.isConversationMuted(user.id, conversationId)
+                        )
                     }
                 }
             }
@@ -888,12 +899,22 @@ fun MuteDurationPickerCard(
 class CallForegroundService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
+    override fun onDestroy() {
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        super.onDestroy()
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val coordinator = SystemNotificationAndFcmManager.activeCallCoordinator
         val state = coordinator?.uiState?.value ?: ActiveCallUiState(
             callId = "ongoing",
             kind = CallKind.AUDIO
         )
+        if (coordinator == null || state.phase == CallPhase.IDLE || state.phase == CallPhase.ENDED) {
+            SystemNotificationAndFcmManager.cancelCallNotification(applicationContext)
+            stopSelf(startId)
+            return START_NOT_STICKY
+        }
         val notification = SystemNotificationAndFcmManager.buildCallNotification(
             context = applicationContext,
             state = state,

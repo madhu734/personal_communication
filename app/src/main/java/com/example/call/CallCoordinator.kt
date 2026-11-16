@@ -1126,6 +1126,10 @@ class CallCoordinator(
         }
     }
 
+    fun onRemoteCallEnded(callId: String) {
+        scope.launch { terminateCallInternal(callId, "Call ended") }
+    }
+
     private fun cleanupCallResourcesLocked(callId: String, reason: String) {
         seenTerminalCallIds.add(callId)
         roomJoinedCallIds.remove(callId)
@@ -1139,8 +1143,8 @@ class CallCoordinator(
             stopRingtoneBlocking()
             releaseRoom(endedRoom)
         }
-        SystemNotificationAndFcmManager.cancelCallNotification(appContext)
         CallForegroundService.stop(appContext)
+        SystemNotificationAndFcmManager.cancelCallNotification(appContext)
 
         _uiState.update {
             it.copy(
