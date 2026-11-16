@@ -50,7 +50,14 @@ class PocketBaseRealtimeClient(
         .retryOnConnectionFailure(true)
         .build()
 
+    @Volatile
     private var activeEventSource: EventSource? = null
+    @Volatile
+    private var connectionGeneration = 0L
+    private val subscriptionHttpClient = sseHttpClient.newBuilder()
+        .callTimeout(20, TimeUnit.SECONDS)
+        .readTimeout(20, TimeUnit.SECONDS)
+        .build()
     private var reconnectJob: Job? = null
     @Volatile
     private var shouldStayConnected: Boolean = false
@@ -73,6 +80,7 @@ class PocketBaseRealtimeClient(
         _onReconnected.emit(Unit)
     }
 
+    @Synchronized
     fun connectIfAuthenticated() {
         val token = sessionStore.getAuthToken()
         if (token.isBlank()) {
@@ -85,8 +93,10 @@ class PocketBaseRealtimeClient(
         openEventSource()
     }
 
+    @Synchronized
     fun disconnect() {
         shouldStayConnected = false
+        connectionGeneration++
         reconnectJob?.cancel()
         reconnectJob = null
         activeEventSource?.cancel()
@@ -94,7 +104,9 @@ class PocketBaseRealtimeClient(
         _isConnected.value = false
     }
 
+    @Synchronized
     private fun openEventSource() {
+        val generation = ++connectionGeneration
         val token = sessionStore.getAuthToken()
         if (!shouldStayConnected || token.isBlank()) return
 
@@ -107,7 +119,7 @@ class PocketBaseRealtimeClient(
         val factory = EventSources.createFactory(sseHttpClient)
         activeEventSource = factory.newEventSource(request, object : EventSourceListener() {
             override fun onOpen(eventSource: EventSource, response: Response) {
-                _isConnected.value = true
+                // Readiness is announced after the authenticated subscription succeeds.
             }
 
             override fun onEvent(
@@ -116,15 +128,24 @@ class PocketBaseRealtimeClient(
                 type: String?,
                 data: String
             ) {
-                if (data.isBlank()) return
+                if (generation != connectionGeneration || !shouldStayConnected || data.isBlank()) return
                 try {
                     val json = JSONObject(data)
                     if (type == "PB_CONNECT") {
                         val clientId = json.optString("clientId").ifBlank { id.orEmpty() }
                         if (clientId.isNotBlank()) {
                             scope.launch {
-                                subscribeTopics(clientId)
-                                _onReconnected.emit(Unit)
+                                val subscribed = subscribeTopics(clientId)
+                                if (generation != connectionGeneration || !shouldStayConnected) return@launch
+                                if (subscribed) {
+                                    _isConnected.value = true
+                                    _onReconnected.emit(Unit)
+                                } else {
+                                    eventSource.cancel()
+                                    _isConnected.value = false
+                                    activeEventSource = null
+                                    scheduleReconnect()
+                                }
                             }
                         }
                         return
@@ -151,12 +172,14 @@ class PocketBaseRealtimeClient(
             }
 
             override fun onClosed(eventSource: EventSource) {
+                if (generation != connectionGeneration || !shouldStayConnected) return
                 _isConnected.value = false
                 activeEventSource = null
                 scheduleReconnect()
             }
 
             override fun onFailure(eventSource: EventSource, t: Throwable?, response: Response?) {
+                if (generation != connectionGeneration || !shouldStayConnected) return
                 _isConnected.value = false
                 activeEventSource = null
                 scheduleReconnect()
@@ -164,9 +187,9 @@ class PocketBaseRealtimeClient(
         })
     }
 
-    private fun subscribeTopics(clientId: String) {
+    private fun subscribeTopics(clientId: String): Boolean {
         val token = sessionStore.getAuthToken()
-        if (token.isBlank()) return
+        if (token.isBlank()) return false
         val topics = JSONArray().apply {
             DEFAULT_TOPICS.forEach { put(it) }
         }
@@ -179,9 +202,10 @@ class PocketBaseRealtimeClient(
             .header("Authorization", token)
             .post(payload.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
             .build()
-        try {
-            sseHttpClient.newCall(req).execute().close()
+        return try {
+            subscriptionHttpClient.newCall(req).execute().use { it.isSuccessful }
         } catch (_: Exception) {
+            false
         }
     }
 

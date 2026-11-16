@@ -55,7 +55,7 @@ jobs:
         with:
           gradle-version: "9.3.1"
 
-      - name: Prepare Signing Keystore (Secrets or Auto-Generated Fallback)
+      - name: Prepare Persistent Signing Keystore
         id: keystore
         shell: bash
         env:
@@ -80,20 +80,8 @@ jobs:
             echo "STORE_PASSWORD=$SECRET_STORE_PASSWORD" >> "$GITHUB_ENV"
             echo "KEY_PASSWORD=$SECRET_KEY_PASSWORD" >> "$GITHUB_ENV"
           else
-            echo "No custom KEYSTORE_BASE64 secret configured; generating self-signed release keystore (alias: upload)..."
-            FALLBACK_PASS="apunkacommunication2026"
-            keytool -genkeypair -v \
-              -keystore "$KEYSTORE_FILE" \
-              -alias upload \
-              -keyalg RSA \
-              -keysize 2048 \
-              -validity 10000 \
-              -storepass "$FALLBACK_PASS" \
-              -keypass "$FALLBACK_PASS" \
-              -dname "CN=Apun Ka Communication, OU=Mobile, O=tmadhu, L=Dhaka, S=Dhaka, C=BD"
-            echo "KEYSTORE_PATH=$KEYSTORE_FILE" >> "$GITHUB_ENV"
-            echo "STORE_PASSWORD=$FALLBACK_PASS" >> "$GITHUB_ENV"
-            echo "KEY_PASSWORD=$FALLBACK_PASS" >> "$GITHUB_ENV"
+            echo "::error::Configure KEYSTORE_BASE64, STORE_PASSWORD and KEY_PASSWORD to preserve the app's signing identity."
+            exit 1
           fi
 
       - name: Ensure .env and optional google-services.json exist

@@ -155,6 +155,12 @@ class MainActivity : FragmentActivity() {
     override fun onResume() {
         super.onResume()
         viewModel.checkBiometricLockStateOnResume()
+        viewModel.setAppInForeground(true)
+    }
+
+    override fun onPause() {
+        viewModel.setAppInForeground(false)
+        super.onPause()
     }
 
     override fun onNewIntent(intent: Intent) {

@@ -48,6 +48,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -113,6 +114,7 @@ class CallCoordinator(
         kind: CallKind
     ) {
         if (sessionStore.getAuthToken().isBlank()) return
+        val pendingCallId = "starting_" + UUID.randomUUID()
         scope.launch {
             val canStart = callMutex.withLock {
                 val currentPhase = _uiState.value.phase
@@ -120,7 +122,7 @@ class CallCoordinator(
                     false
                 } else {
                     _uiState.value = ActiveCallUiState(
-                        callId = "starting_${System.currentTimeMillis()}",
+                        callId = pendingCallId,
                         conversationId = conversationId,
                         peer = peer,
                         kind = kind,
@@ -138,7 +140,7 @@ class CallCoordinator(
             val endpoints = querySystemAudioEndpoints()
             try {
                 val record = apiClient.startCall(conversationId, kind)
-                if (!_uiState.value.callId.startsWith("starting_") || _uiState.value.phase != CallPhase.OUTGOING_RINGING) {
+                if (_uiState.value.callId != pendingCallId || _uiState.value.phase != CallPhase.OUTGOING_RINGING) {
                     apiClient.endCall(record.id)
                     return@launch
                 }
@@ -171,6 +173,7 @@ class CallCoordinator(
                 startAuthoritativeCallPoller(record.id)
             } catch (e: Exception) {
                 callMutex.withLock {
+                    if (_uiState.value.callId != pendingCallId) return@launch
                     _uiState.value = ActiveCallUiState(
                         callId = "err_${System.currentTimeMillis()}",
                         conversationId = conversationId,
@@ -396,7 +399,7 @@ class CallCoordinator(
                     onCallRecordUpdated(fresh)
                     if (fresh.status.isTerminal) break
                 } catch (e: ApiException) {
-                    if (e.statusCode == 404) {
+                    if (e.statusCode == 404 || e.statusCode == 401 || e.statusCode == 403) {
                         terminateCallInternal(callId, "Call ended")
                         break
                     }
