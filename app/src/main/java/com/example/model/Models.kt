@@ -195,6 +195,7 @@ data class CallRecord(
     val acceptedAt: String = "",
     val connectedAt: String = "",
     val endedAt: String = "",
+    val secureBy: String = "",
     val created: String = ""
 )
 
@@ -246,6 +247,7 @@ data class ActiveCallUiState(
     val isCameraEnabled: Boolean = false,
     val isFrontCamera: Boolean = true,
     val isScreenSharing: Boolean = false,
+    val secureBy: String = "",
     val videoQuality: VideoQualityPreset = VideoQualityPreset.AUTO_720P,
     val isFocusMode: Boolean = false,
     val isMinimizedInApp: Boolean = false,

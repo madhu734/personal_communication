@@ -132,6 +132,14 @@ class MainActivity : FragmentActivity() {
                     }
                 }
 
+                LaunchedEffect(callState.secureBy, callState.phase) {
+                    if (callState.secureBy.isNotBlank() && callState.phase != CallPhase.ENDED && callState.phase != CallPhase.IDLE) {
+                        window.addFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE)
+                    } else {
+                        window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE)
+                    }
+                }
+
                 // Update Android 12+ auto-enter PiP eligibility whenever video call state changes
                 LaunchedEffect(callState.phase, callState.kind, callState.isCameraEnabled) {
                     updatePipParams()

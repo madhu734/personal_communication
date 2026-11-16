@@ -352,6 +352,7 @@ class CallCoordinator(
                         conversationId = record.conversation.ifBlank { it.conversationId },
                         peer = resolvedPeer,
                         kind = record.kind,
+                        secureBy = record.secureBy,
                         roomName = record.room.ifBlank { it.roomName }
                     )
                 }
@@ -956,6 +957,24 @@ class CallCoordinator(
         }
     }
 
+    fun toggleSecureMode() {
+        val state = _uiState.value
+        val user = sessionStore.getUserRecord()?.id.orEmpty()
+        if (state.callId.isBlank() || user.isBlank()) return
+        if (state.secureBy.isNotBlank() && state.secureBy != user) {
+            _uiState.update { it.copy(statusBannerText = "Only the person who enabled secure mode can turn it off.") }
+            return
+        }
+        scope.launch {
+            try {
+                val updated = apiClient.setCallSecure(state.callId, state.secureBy.isBlank())
+                onCallRecordUpdated(updated)
+            } catch (e: Exception) {
+                _uiState.update { it.copy(statusBannerText = "Could not change secure mode. Try again.") }
+            }
+        }
+    }
+
     fun toggleFocusMode() {
         _uiState.update {
             it.copy(
@@ -1151,6 +1170,7 @@ class CallCoordinator(
                 phase = CallPhase.ENDED,
                 isCameraEnabled = false,
                 isScreenSharing = false,
+                secureBy = "",
                 isMinimizedInApp = false,
                 isInPipMode = false,
                 showInCallChatSheet = false,

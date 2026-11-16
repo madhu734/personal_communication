@@ -49,6 +49,8 @@ import androidx.compose.material.icons.filled.DeleteForever
 import androidx.compose.material.icons.filled.Expand
 import androidx.compose.material.icons.filled.Headset
 import androidx.compose.material.icons.filled.HighQuality
+import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.LockOpen
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MicOff
 import androidx.compose.material.icons.filled.Minimize
@@ -438,6 +440,7 @@ fun FullScreenCallOverlay(
                         coordinator.refreshAvailableAudioEndpoints()
                         showAudioEndpointSheet = true
                     },
+                    onToggleSecure = { coordinator.toggleSecureMode() },
                     onToggleScreenShare = {
                         if (callState.isScreenSharing) {
                             coordinator.setScreenSharing(false)
@@ -679,6 +682,7 @@ private fun ActiveCallControlDock(
     onToggleCamera: () -> Unit,
     onOpenAudioPicker: () -> Unit,
     onToggleScreenShare: () -> Unit,
+    onToggleSecure: () -> Unit,
     onOpenInCallChat: () -> Unit,
     onHangUp: () -> Unit
 ) {
@@ -737,6 +741,15 @@ private fun ActiveCallControlDock(
                 iconTint = if (callState.isScreenSharing) Color(0xFF042F2E) else Color.White,
                 onClick = onToggleScreenShare,
                 testTag = "call_screen_share_btn"
+            )
+
+            RoundCallControlButton(
+                icon = if (callState.secureBy.isNotBlank()) Icons.Default.Lock else Icons.Default.LockOpen,
+                contentDescription = if (callState.secureBy.isNotBlank()) "Secure mode on" else "Secure mode off",
+                backgroundColor = if (callState.secureBy.isNotBlank()) EmeraldPrimaryDark else Color.White.copy(alpha = 0.14f),
+                iconTint = Color.White,
+                onClick = onToggleSecure,
+                testTag = "call_secure_mode_btn"
             )
 
             RoundCallControlButton(

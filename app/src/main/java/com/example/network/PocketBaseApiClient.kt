@@ -875,6 +875,14 @@ class PocketBaseApiClient(
         executeNoContent(req)
     }
 
+    suspend fun setCallSecure(callId: String, enabled: Boolean): CallRecord = withContext(Dispatchers.IO) {
+        val payload = JSONObject().put("enabled", enabled)
+        val request = authenticatedBuilder("/api/app/calls/$callId/secure")
+            .put(payload.toString().toRequestBody(JSON_MEDIA))
+            .build()
+        parseCallRecord(executeJson(request, isAuthCheck = false))
+    }
+
     suspend fun fetchCallToken(callId: String): CallTokenGrant = withContext(Dispatchers.IO) {
         val payload = JSONObject().put("deviceId", sessionStore.deviceId)
         val req = authenticatedBuilder("/api/app/calls/$callId/token")
@@ -1035,6 +1043,7 @@ class PocketBaseApiClient(
             acceptedAt = obj.optString("accepted_at"),
             connectedAt = obj.optString("connected_at"),
             endedAt = obj.optString("ended_at"),
+            secureBy = obj.optString("secure_by"),
             created = obj.optString("created")
         )
     }
