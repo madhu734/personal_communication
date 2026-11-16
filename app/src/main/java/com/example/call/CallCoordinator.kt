@@ -37,6 +37,7 @@ import io.livekit.android.room.track.LocalVideoTrack
 import io.livekit.android.room.track.Track
 import io.livekit.android.room.track.VideoPreset169
 import io.livekit.android.room.track.VideoTrack
+import io.livekit.android.room.track.screencapture.ScreenCaptureParams
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -812,10 +813,9 @@ class CallCoordinator(
     private fun updateRemoteVideoTrack(room: Room) {
         if (activeLiveKitRoom !== room) return
         _remoteVideoTrack.value = room.remoteParticipants.values
-            .flatMap { it.videoTrackPublications }
-            .filter { (publication, track) -> !publication.muted && track is VideoTrack }
-            .sortedByDescending { (publication, _) -> publication.source == Track.Source.SCREEN_SHARE }
-            .firstOrNull()?.second as? VideoTrack
+            .flatMap { it.trackPublications.values }
+            .filter { !it.muted && it.track is VideoTrack }
+            .maxByOrNull { it.source == Track.Source.SCREEN_SHARE }?.track as? VideoTrack
     }
 
     private fun updateLocalVideoTrackRef(room: Room) {
@@ -933,17 +933,25 @@ class CallCoordinator(
     }
 
     fun setScreenSharing(enabled: Boolean, mediaProjectionPermissionResultData: android.content.Intent? = null) {
-        _uiState.update {
-            it.copy(
-                isScreenSharing = enabled,
-                statusBannerText = if (enabled) "Sharing screen" else "Connected"
-            )
-        }
         val room = activeLiveKitRoom ?: return
         scope.launch {
             try {
-                room.localParticipant.setScreenShareEnabled(enabled, mediaProjectionPermissionResultData)
-            } catch (_: Exception) {
+                val params = mediaProjectionPermissionResultData?.let { ScreenCaptureParams(it) }
+                check(room.localParticipant.setScreenShareEnabled(enabled, params))
+                if (activeLiveKitRoom === room) {
+                    _uiState.update {
+                        it.copy(
+                            isScreenSharing = enabled,
+                            statusBannerText = if (enabled) "Sharing screen" else "Connected"
+                        )
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (activeLiveKitRoom === room) {
+                    _uiState.update { it.copy(statusBannerText = "Could not change screen sharing.") }
+                }
             }
         }
     }
