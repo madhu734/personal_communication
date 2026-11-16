@@ -24,6 +24,14 @@ jobs:
       - name: Prepare debug signing
         run: |
           keytool -genkeypair -keystore debug.keystore -storepass android -keypass android -alias androiddebugkey -keyalg RSA -validity 365 -dname 'CN=Android Debug'
+      - name: Prepare Firebase client config for phone tests
+        env:
+          FIREBASE_CLIENT_CONFIG: ${{ secrets.GOOGLE_SERVICES_JSON_BASE64 }}
+        run: |
+          if [ -n "$FIREBASE_CLIENT_CONFIG" ]; then
+            echo "$FIREBASE_CLIENT_CONFIG" | base64 -d > /tmp/firebase-client.json
+            python3 -c 'import json; p="/tmp/firebase-client.json"; d=json.load(open(p)); c=next(x for x in d["client"] if x["client_info"]["android_client_info"]["package_name"]=="me.tmadhu.mandychat"); c["client_info"]["android_client_info"]["package_name"]="me.tmadhu.mandychat.calltest"; json.dump(d,open("app/google-services.json","w"))'
+          fi
       - name: Build phone-test APK
         run: gradle :app:assembleDebug -PsideBySideInstall --no-daemon --max-workers=2 -Dorg.gradle.jvmargs='-Xmx3g -Dfile.encoding=UTF-8'
       - uses: actions/upload-artifact@v4
