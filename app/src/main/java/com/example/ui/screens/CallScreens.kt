@@ -9,8 +9,10 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -36,11 +38,14 @@ import androidx.compose.material.icons.automirrored.filled.ScreenShare
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.automirrored.filled.StopScreenShare
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
+import androidx.compose.material.icons.filled.Block
 import androidx.compose.material.icons.filled.BluetoothAudio
 import androidx.compose.material.icons.filled.Call
 import androidx.compose.material.icons.filled.CallEnd
 import androidx.compose.material.icons.filled.Cameraswitch
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.DeleteForever
 import androidx.compose.material.icons.filled.Expand
 import androidx.compose.material.icons.filled.Headset
 import androidx.compose.material.icons.filled.HighQuality
@@ -51,8 +56,11 @@ import androidx.compose.material.icons.filled.PhoneInTalk
 import androidx.compose.material.icons.filled.PictureInPictureAlt
 import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material.icons.filled.VideocamOff
+import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -61,6 +69,7 @@ import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -78,9 +87,12 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
@@ -116,6 +128,7 @@ fun FullScreenCallOverlay(
     val coordinator = viewModel.callCoordinator
     val activeRoom by coordinator.activeRoomFlow.collectAsStateWithLifecycle()
     val localVideoTrack by coordinator.localVideoTrack.collectAsStateWithLifecycle()
+    val appUiState by viewModel.uiState.collectAsStateWithLifecycle()
 
     var showAudioEndpointSheet by remember { mutableStateOf(false) }
     var showQualitySheet by remember { mutableStateOf(false) }
@@ -209,8 +222,13 @@ fun FullScreenCallOverlay(
             InCallChatSheetContent(
                 conversationId = callState.conversationId,
                 peerName = callState.peer.name,
+                ownUserId = appUiState.currentUser?.id.orEmpty(),
                 messages = inCallMessages,
                 draft = callState.inCallChatDraft,
+                errorMessage = appUiState.errorMessage,
+                canRetryError = appUiState.retryableAction != null,
+                onRetryError = { viewModel.retryLastFailedAction() },
+                onDismissError = { viewModel.clearBannerAndError() },
                 onDraftChanged = { coordinator.updateInCallChatDraft(it) },
                 onSend = {
                     if (callState.inCallChatDraft.isNotBlank() && callState.conversationId.isNotBlank()) {
@@ -221,7 +239,9 @@ fun FullScreenCallOverlay(
                         )
                         coordinator.updateInCallChatDraft("")
                     }
-                }
+                },
+                onDeleteForMe = { viewModel.deleteMessageForMe(it) },
+                onDeleteForEveryone = { viewModel.deleteMessageForEveryone(it) }
             )
         }
     }
@@ -1079,15 +1099,26 @@ private fun VideoQualityPickerSheet(
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun InCallChatSheetContent(
+internal fun InCallChatSheetContent(
     conversationId: String,
     peerName: String,
+    ownUserId: String,
     messages: List<ChatMessage>,
     draft: String,
+    errorMessage: String? = null,
+    canRetryError: Boolean = false,
+    onRetryError: () -> Unit = {},
+    onDismissError: () -> Unit = {},
     onDraftChanged: (String) -> Unit,
-    onSend: () -> Unit
+    onSend: () -> Unit,
+    onDeleteForMe: (ChatMessage) -> Unit = {},
+    onDeleteForEveryone: (ChatMessage) -> Unit = {}
 ) {
+    val haptic = LocalHapticFeedback.current
+    var expandedMenuMessageKey by remember { mutableStateOf<String?>(null) }
+
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -1099,7 +1130,46 @@ private fun InCallChatSheetContent(
             style = MaterialTheme.typography.titleLarge,
             color = Color.White
         )
-        Spacer(modifier = Modifier.height(10.dp))
+        Spacer(modifier = Modifier.height(8.dp))
+
+        if (!errorMessage.isNullOrBlank()) {
+            Surface(
+                shape = RoundedCornerShape(10.dp),
+                color = CoralHangup,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 8.dp)
+                    .testTag("in_call_error_banner")
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = errorMessage,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color.White,
+                        modifier = Modifier.weight(1f)
+                    )
+                    if (canRetryError) {
+                        TextButton(
+                            onClick = onRetryError,
+                            modifier = Modifier.testTag("in_call_retry_button")
+                        ) {
+                            Text("Retry", color = Color.White)
+                        }
+                    }
+                    IconButton(onClick = onDismissError, modifier = Modifier.size(28.dp)) {
+                        Icon(
+                            imageVector = Icons.Default.Close,
+                            contentDescription = "Dismiss error",
+                            tint = Color.White,
+                            modifier = Modifier.size(16.dp)
+                        )
+                    }
+                }
+            }
+        }
 
         LazyColumn(
             contentPadding = PaddingValues(vertical = 8.dp),
@@ -1109,24 +1179,133 @@ private fun InCallChatSheetContent(
                 .fillMaxWidth()
         ) {
             items(messages.takeLast(15), key = { it.id.ifBlank { it.clientMessageId } }) { msg ->
-                Surface(
-                    shape = RoundedCornerShape(12.dp),
-                    color = Color.White.copy(alpha = 0.1f),
-                    modifier = Modifier.fillMaxWidth()
+                val msgKey = msg.id.ifBlank { msg.clientMessageId }
+                val isSaved = msg.id.isNotBlank() && !msg.id.startsWith("local_")
+                val isOwn = msg.sender == ownUserId
+                val repliedMsg = msg.replyTo.takeIf { it.isNotBlank() }?.let { rId ->
+                    messages.firstOrNull { it.id == rId }
+                }
+
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("in_call_message_${msg.id}")
                 ) {
-                    Row(
-                        modifier = Modifier.padding(10.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = if (msg.isDeleted) Color.White.copy(alpha = 0.06f)
+                        else Color.White.copy(alpha = 0.1f),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .combinedClickable(
+                                enabled = isSaved,
+                                onClick = {
+                                    if (isSaved) expandedMenuMessageKey = msgKey
+                                },
+                                onLongClick = {
+                                    if (isSaved) {
+                                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                        expandedMenuMessageKey = msgKey
+                                    }
+                                }
+                            )
+                            .then(
+                                if (msg.isDeleted) {
+                                    Modifier.testTag("in_call_deleted_placeholder_${msg.id}")
+                                } else {
+                                    Modifier
+                                }
+                            )
                     ) {
-                        Text(
-                            text = msg.text.ifBlank { "[${msg.kind.wireName}]" },
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = Color.White,
-                            modifier = Modifier.weight(1f)
+                        Column(modifier = Modifier.padding(10.dp)) {
+                            if (!msg.isDeleted && repliedMsg != null) {
+                                val replyPreview = if (repliedMsg.isDeleted) {
+                                    "This message was deleted."
+                                } else {
+                                    repliedMsg.text.ifBlank { "[${repliedMsg.kind.wireName}]" }
+                                }
+                                Text(
+                                    text = "↳ $replyPreview",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontStyle = if (repliedMsg.isDeleted) FontStyle.Italic else FontStyle.Normal,
+                                    color = Color.White.copy(alpha = 0.72f),
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.padding(bottom = 4.dp)
+                                )
+                            }
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                if (msg.isDeleted) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        modifier = Modifier.weight(1f)
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Default.Block,
+                                            contentDescription = null,
+                                            tint = Color.White.copy(alpha = 0.65f),
+                                            modifier = Modifier.size(15.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                        Text(
+                                            text = "This message was deleted.",
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            fontStyle = FontStyle.Italic,
+                                            color = Color.White.copy(alpha = 0.75f)
+                                        )
+                                    }
+                                } else {
+                                    Text(
+                                        text = msg.text.ifBlank { "[${msg.kind.wireName}]" },
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        color = Color.White,
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                }
+                                Spacer(modifier = Modifier.width(8.dp))
+                                if (isOwn) {
+                                    MessageTickIndicator(deliveryState = msg.deliveryState)
+                                }
+                            }
+                        }
+                    }
+
+                    DropdownMenu(
+                        expanded = expandedMenuMessageKey == msgKey,
+                        onDismissRequest = { expandedMenuMessageKey = null }
+                    ) {
+                        DropdownMenuItem(
+                            text = { Text("Delete for me") },
+                            leadingIcon = {
+                                Icon(Icons.Default.VisibilityOff, contentDescription = null)
+                            },
+                            onClick = {
+                                expandedMenuMessageKey = null
+                                onDeleteForMe(msg)
+                            },
+                            modifier = Modifier.testTag("in_call_delete_for_me_${msg.id}")
                         )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        MessageTickIndicator(deliveryState = msg.deliveryState)
+                        if (isOwn && !msg.isDeleted) {
+                            DropdownMenuItem(
+                                text = { Text("Delete for everyone") },
+                                leadingIcon = {
+                                    Icon(
+                                        Icons.Default.DeleteForever,
+                                        contentDescription = null,
+                                        tint = CoralHangup
+                                    )
+                                },
+                                onClick = {
+                                    expandedMenuMessageKey = null
+                                    onDeleteForEveryone(msg)
+                                },
+                                modifier = Modifier.testTag("in_call_delete_for_everyone_${msg.id}")
+                            )
+                        }
                     }
                 }
             }

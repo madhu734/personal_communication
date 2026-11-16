@@ -84,7 +84,13 @@ object SystemNotificationAndFcmManager {
     const val EXTRA_RETRY_TEXT = "extra_retry_text"
     const val EXTRA_CALL_ID = "extra_call_id"
 
-    private val conversationHistoryMap = ConcurrentHashMap<String, MutableList<Pair<String, String>>>()
+    private data class CachedNotificationMessage(
+        val messageId: String,
+        val senderName: String,
+        val messageText: String
+    )
+
+    private val conversationHistoryMap = ConcurrentHashMap<String, MutableList<CachedNotificationMessage>>()
     private val deduplicatedMessageEvents = ConcurrentHashMap.newKeySet<String>()
 
     @Volatile
@@ -294,7 +300,7 @@ object SystemNotificationAndFcmManager {
         val history = conversationHistoryMap.getOrPut(conversationId) { mutableListOf() }
         synchronized(history) {
             if (messageText.isNotBlank()) {
-                history.add(senderName to messageText)
+                history.add(CachedNotificationMessage(messageId, senderName, messageText))
                 while (history.size > 5) {
                     history.removeAt(0)
                 }
@@ -306,9 +312,9 @@ object SystemNotificationAndFcmManager {
             .setConversationTitle(peerName)
 
         synchronized(history) {
-            history.forEachIndexed { idx, (author, body) ->
-                val p = Person.Builder().setName(author).build()
-                messagingStyle.addMessage(body, System.currentTimeMillis() + idx, p)
+            history.forEachIndexed { idx, entry ->
+                val p = Person.Builder().setName(entry.senderName).build()
+                messagingStyle.addMessage(entry.messageText, System.currentTimeMillis() + idx, p)
             }
         }
 
@@ -436,6 +442,23 @@ object SystemNotificationAndFcmManager {
         }
     }
 
+    fun removeMessageFromNotifications(context: Context, conversationId: String, messageId: String) {
+        if (messageId.isBlank()) return
+        val targets = if (conversationId.isNotBlank()) listOf(conversationId) else conversationHistoryMap.keys.toList()
+        targets.forEach { convId ->
+            val history = conversationHistoryMap[convId] ?: return@forEach
+            val removed = synchronized(history) {
+                history.removeAll { it.messageId == messageId }
+            }
+            if (removed) {
+                val emptyNow = synchronized(history) { history.isEmpty() }
+                if (emptyNow) {
+                    cancelConversationNotification(context, convId)
+                }
+            }
+        }
+    }
+
     fun cancelAllNotifications(context: Context) {
         conversationHistoryMap.clear()
         deduplicatedMessageEvents.clear()
@@ -538,7 +561,7 @@ class ApunKaMessagingService : FirebaseMessagingService() {
         val api = PocketBaseApiClient(store)
         try {
             val messages = api.fetchMessages(conversationId = conversationId, perPage = 5)
-            val latestPeerMsg = messages.lastOrNull { it.sender != ownUser.id }
+            val latestPeerMsg = messages.lastOrNull { it.sender != ownUser.id && !it.isDeleted }
             if (latestPeerMsg != null) {
                 // Acknowledge that the message was genuinely synced to this device (`✓✓` gray Delivered)
                 api.markConversationDelivered(conversationId, latestPeerMsg.id)

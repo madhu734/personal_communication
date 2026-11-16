@@ -8,6 +8,7 @@ import com.example.model.ChatMessage
 import com.example.model.ChatSummary
 import com.example.model.ConversationMemberRecord
 import com.example.model.MessageDeliveryState
+import com.example.model.MessageHideRecord
 import com.example.model.MessageKind
 import com.example.model.MessageReaction
 import com.example.model.MessageRequestItem
@@ -667,6 +668,57 @@ class PocketBaseApiClient(
             parseChatMessage(executeJson(req, isAuthCheck = false))
         }
 
+    suspend fun deleteMessageForMe(messageId: String) = withContext(Dispatchers.IO) {
+        val url = "$baseUrl/api/app/messages/$messageId".toHttpUrlOrNull()!!
+            .newBuilder()
+            .addQueryParameter("scope", "me")
+            .build()
+        val req = authenticatedBuilder(url.toString())
+            .delete()
+            .build()
+        executeNoContent(req)
+    }
+
+    suspend fun deleteMessageForEveryone(messageId: String): ChatMessage =
+        withContext(Dispatchers.IO) {
+            val url = "$baseUrl/api/app/messages/$messageId".toHttpUrlOrNull()!!
+                .newBuilder()
+                .addQueryParameter("scope", "everyone")
+                .build()
+            val req = authenticatedBuilder(url.toString())
+                .delete()
+                .build()
+            val json = executeJson(req, isAuthCheck = false)
+            val recordObj = json.optJSONObject("record") ?: json
+            parseChatMessage(recordObj).normalizedForDeletedState()
+        }
+
+    suspend fun fetchMessageHides(perPage: Int = 500): List<MessageHideRecord>? =
+        withContext(Dispatchers.IO) {
+            val url = "$baseUrl/api/collections/message_hides/records".toHttpUrlOrNull()!!
+                .newBuilder()
+                .addQueryParameter("perPage", perPage.toString())
+                .build()
+            val req = Request.Builder()
+                .url(url)
+                .header("Authorization", sessionStore.getAuthToken())
+                .header("X-App-Device", sessionStore.deviceId)
+                .get()
+                .build()
+            try {
+                val json = executeJson(req, isAuthCheck = false)
+                val items = json.optJSONArray("items") ?: JSONArray()
+                buildList {
+                    for (i in 0 until items.length()) {
+                        val obj = items.optJSONObject(i) ?: continue
+                        add(parseMessageHideRecord(obj))
+                    }
+                }
+            } catch (e: ApiException) {
+                if (e.statusCode == 403 || e.statusCode == 404) null else throw e
+            }
+        }
+
     suspend fun setReaction(messageId: String, emoji: String) = withContext(Dispatchers.IO) {
         val payload = JSONObject().put("emoji", emoji)
         val req = authenticatedBuilder("/api/app/reactions/$messageId")
@@ -918,20 +970,31 @@ class PocketBaseApiClient(
             verified = obj.optBoolean("verified", true)
         )
 
+        private fun JSONObject.optNonNullString(key: String): String =
+            if (!has(key) || isNull(key)) "" else optString(key)
+
         fun parseChatMessage(obj: JSONObject): ChatMessage = ChatMessage(
-            id = obj.optString("id"),
-            conversation = obj.optString("conversation"),
-            sender = obj.optString("sender"),
-            text = obj.optString("text"),
-            clientMessageId = obj.optString("client_message_id"),
-            kind = MessageKind.fromWire(obj.optString("kind", "text")),
-            attachment = obj.optString("attachment"),
+            id = obj.optNonNullString("id"),
+            conversation = obj.optNonNullString("conversation"),
+            sender = obj.optNonNullString("sender"),
+            text = obj.optNonNullString("text"),
+            clientMessageId = obj.optNonNullString("client_message_id"),
+            kind = MessageKind.fromWire(obj.optNonNullString("kind").ifBlank { "text" }),
+            attachment = obj.optNonNullString("attachment"),
             attachmentBytes = obj.optLong("attachment_bytes", 0L),
-            replyTo = obj.optString("reply_to"),
+            replyTo = obj.optNonNullString("reply_to"),
             inCall = obj.optBoolean("in_call", false),
-            created = obj.optString("created"),
-            updated = obj.optString("updated").ifBlank { obj.optString("created") },
+            created = obj.optNonNullString("created"),
+            updated = obj.optNonNullString("updated").ifBlank { obj.optNonNullString("created") },
+            deletedAt = obj.optNonNullString("deleted_at"),
             deliveryState = MessageDeliveryState.SENT
+        ).normalizedForDeletedState()
+
+        fun parseMessageHideRecord(obj: JSONObject): MessageHideRecord = MessageHideRecord(
+            id = obj.optNonNullString("id"),
+            message = obj.optNonNullString("message"),
+            user = obj.optNonNullString("user"),
+            conversation = obj.optNonNullString("conversation")
         )
 
         fun parseConversationMember(obj: JSONObject): ConversationMemberRecord =

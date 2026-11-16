@@ -45,8 +45,10 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Reply
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.AttachFile
+import androidx.compose.material.icons.filled.Block
 import androidx.compose.material.icons.filled.Call
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.DeleteForever
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MoreVert
@@ -55,9 +57,11 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.Videocam
+import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material.icons.outlined.EmojiEmotions
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -84,8 +88,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.style.TextOverflow
@@ -129,7 +135,7 @@ fun ChatDetailScreen(
 
     var composerText by rememberSaveable(conversationId) { mutableStateOf("") }
     var showOverflowMenu by remember { mutableStateOf(false) }
-    var selectedMessageForActions by remember { mutableStateOf<ChatMessage?>(null) }
+    var selectedMessageKeyForActions by remember { mutableStateOf<String?>(null) }
     var customEmojiTargetMessage by remember { mutableStateOf<ChatMessage?>(null) }
     var customEmojiInput by rememberSaveable { mutableStateOf("") }
 
@@ -183,29 +189,43 @@ fun ChatDetailScreen(
         }
     }
 
-    if (selectedMessageForActions != null) {
-        val target = selectedMessageForActions!!
+    val activeActionTarget = selectedMessageKeyForActions?.let { key ->
+        messages.firstOrNull { (it.id.ifBlank { it.clientMessageId }) == key }
+    }
+    if (selectedMessageKeyForActions != null && activeActionTarget == null) {
+        selectedMessageKeyForActions = null
+    }
+
+    if (activeActionTarget != null) {
         ModalBottomSheet(
-            onDismissRequest = { selectedMessageForActions = null }
+            onDismissRequest = { selectedMessageKeyForActions = null }
         ) {
             MessageActionAndReactionSheet(
-                message = target,
-                isOwnMessage = target.sender == ownUserId,
+                message = activeActionTarget,
+                isOwnMessage = activeActionTarget.sender == ownUserId,
                 onSelectReaction = { emoji ->
-                    viewModel.toggleOrSetReaction(conversationId, target.id, emoji)
-                    selectedMessageForActions = null
+                    viewModel.toggleOrSetReaction(conversationId, activeActionTarget.id, emoji)
+                    selectedMessageKeyForActions = null
                 },
                 onOpenCustomEmoji = {
-                    customEmojiTargetMessage = target
-                    selectedMessageForActions = null
+                    customEmojiTargetMessage = activeActionTarget
+                    selectedMessageKeyForActions = null
                 },
                 onReply = {
-                    viewModel.setReplyTarget(target)
-                    selectedMessageForActions = null
+                    viewModel.setReplyTarget(activeActionTarget)
+                    selectedMessageKeyForActions = null
                 },
                 onEdit = {
-                    viewModel.setEditingMessage(target)
-                    selectedMessageForActions = null
+                    viewModel.setEditingMessage(activeActionTarget)
+                    selectedMessageKeyForActions = null
+                },
+                onDeleteForMe = {
+                    viewModel.deleteMessageForMe(activeActionTarget)
+                    selectedMessageKeyForActions = null
+                },
+                onDeleteForEveryone = {
+                    viewModel.deleteMessageForEveryone(activeActionTarget)
+                    selectedMessageKeyForActions = null
                 }
             )
         }
@@ -459,7 +479,11 @@ fun ChatDetailScreen(
                     ownUserId = ownUserId,
                     isPlayingAudio = uiState.playingAudioMessageId == msg.id,
                     apiClient = viewModel.apiClient,
-                    onLongPressOrAction = { selectedMessageForActions = msg },
+                    onLongPressOrAction = {
+                        if (!msg.id.startsWith("local_")) {
+                            selectedMessageKeyForActions = msg.id.ifBlank { msg.clientMessageId }
+                        }
+                    },
                     onToggleReaction = { emoji ->
                         viewModel.toggleOrSetReaction(conversationId, msg.id, emoji)
                     },
@@ -505,7 +529,11 @@ fun ChatDetailScreen(
                             color = MaterialTheme.colorScheme.primary
                         )
                         Text(
-                            text = (editingTarget?.text ?: replyTarget?.text).orEmpty(),
+                            text = when {
+                                editingTarget != null -> editingTarget.text
+                                replyTarget?.isDeleted == true -> "This message was deleted."
+                                else -> replyTarget?.text.orEmpty()
+                            },
                             style = MaterialTheme.typography.bodyMedium,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
@@ -756,6 +784,7 @@ private fun MessageBubbleItem(
     onPlayVoiceNote: () -> Unit,
     onRetryFailed: () -> Unit
 ) {
+    val haptic = LocalHapticFeedback.current
     val bubbleColor = if (isOwnMessage) {
         MaterialTheme.colorScheme.primaryContainer
     } else {
@@ -780,77 +809,113 @@ private fun MessageBubbleItem(
                 bottomStart = if (isOwnMessage) 18.dp else 4.dp,
                 bottomEnd = if (isOwnMessage) 4.dp else 18.dp
             ),
-            color = bubbleColor,
-            tonalElevation = 2.dp,
+            color = if (message.isDeleted) bubbleColor.copy(alpha = 0.65f) else bubbleColor,
+            tonalElevation = if (message.isDeleted) 0.dp else 2.dp,
             modifier = Modifier
                 .widthIn(min = 90.dp, max = 310.dp)
                 .combinedClickable(
                     onClick = { onLongPressOrAction() },
-                    onLongClick = { onLongPressOrAction() }
+                    onLongClick = {
+                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                        onLongPressOrAction()
+                    }
+                )
+                .then(
+                    if (message.isDeleted) {
+                        Modifier.testTag("deleted_message_placeholder_${message.id}")
+                    } else {
+                        Modifier
+                    }
                 )
         ) {
             Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 9.dp)) {
-                if (repliedMessage != null) {
-                    Surface(
-                        shape = RoundedCornerShape(8.dp),
-                        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.45f),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(bottom = 6.dp)
+                if (message.isDeleted) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
+                        Icon(
+                            imageVector = Icons.Default.Block,
+                            contentDescription = null,
+                            tint = textColor.copy(alpha = 0.65f),
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
                         Text(
-                            text = "↳ ${repliedMessage.text.ifBlank { "[${repliedMessage.kind.wireName}]" }}",
-                            style = MaterialTheme.typography.labelSmall,
-                            maxLines = 2,
-                            overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier.padding(8.dp)
+                            text = "This message was deleted.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontStyle = FontStyle.Italic,
+                            color = textColor.copy(alpha = 0.72f)
                         )
                     }
-                }
-
-                if (message.kind == MessageKind.IMAGE || message.kind == MessageKind.VIDEO) {
-                    ProtectedMessageMediaPreview(
-                        apiClient = apiClient,
-                        message = message
-                    )
-                    Spacer(modifier = Modifier.height(6.dp))
-                }
-
-                if (message.kind == MessageKind.VOICE) {
-                    Surface(
-                        shape = RoundedCornerShape(12.dp),
-                        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.35f),
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clickable(onClick = onPlayVoiceNote)
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
-                            verticalAlignment = Alignment.CenterVertically
+                } else {
+                    if (repliedMessage != null) {
+                        val replyPreview = if (repliedMessage.isDeleted) {
+                            "This message was deleted."
+                        } else {
+                            repliedMessage.text.ifBlank { "[${repliedMessage.kind.wireName}]" }
+                        }
+                        Surface(
+                            shape = RoundedCornerShape(8.dp),
+                            color = MaterialTheme.colorScheme.surface.copy(alpha = 0.45f),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(bottom = 6.dp)
                         ) {
-                            Icon(
-                                imageVector = if (isPlayingAudio) Icons.Default.Stop
-                                else Icons.Default.PlayArrow,
-                                contentDescription = if (isPlayingAudio) "Stop voice note" else "Play voice note",
-                                tint = MaterialTheme.colorScheme.primary
-                            )
-                            Spacer(modifier = Modifier.width(8.dp))
                             Text(
-                                text = message.text.ifBlank { "Voice Note" },
-                                style = MaterialTheme.typography.labelLarge,
-                                color = textColor
+                                text = "↳ $replyPreview",
+                                style = MaterialTheme.typography.labelSmall,
+                                fontStyle = if (repliedMessage.isDeleted) FontStyle.Italic else FontStyle.Normal,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.padding(8.dp)
                             )
                         }
                     }
-                    Spacer(modifier = Modifier.height(4.dp))
-                }
 
-                if (message.text.isNotBlank() && message.kind != MessageKind.VOICE) {
-                    Text(
-                        text = message.text,
-                        style = MaterialTheme.typography.bodyLarge,
-                        color = textColor
-                    )
+                    if (message.kind == MessageKind.IMAGE || message.kind == MessageKind.VIDEO) {
+                        ProtectedMessageMediaPreview(
+                            apiClient = apiClient,
+                            message = message
+                        )
+                        Spacer(modifier = Modifier.height(6.dp))
+                    }
+
+                    if (message.kind == MessageKind.VOICE) {
+                        Surface(
+                            shape = RoundedCornerShape(12.dp),
+                            color = MaterialTheme.colorScheme.surface.copy(alpha = 0.35f),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable(onClick = onPlayVoiceNote)
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    imageVector = if (isPlayingAudio) Icons.Default.Stop
+                                    else Icons.Default.PlayArrow,
+                                    contentDescription = if (isPlayingAudio) "Stop voice note" else "Play voice note",
+                                    tint = MaterialTheme.colorScheme.primary
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(
+                                    text = message.text.ifBlank { "Voice Note" },
+                                    style = MaterialTheme.typography.labelLarge,
+                                    color = textColor
+                                )
+                            }
+                        }
+                        Spacer(modifier = Modifier.height(4.dp))
+                    }
+
+                    if (message.text.isNotBlank() && message.kind != MessageKind.VOICE) {
+                        Text(
+                            text = message.text,
+                            style = MaterialTheme.typography.bodyLarge,
+                            color = textColor
+                        )
+                    }
                 }
 
                 Spacer(modifier = Modifier.height(4.dp))
@@ -909,7 +974,7 @@ private fun MessageBubbleItem(
             }
         }
 
-        if (reactions.isNotEmpty()) {
+        if (!message.isDeleted && reactions.isNotEmpty()) {
             val grouped = reactions.groupBy { it.emoji }
             FlowRow(
                 horizontalArrangement = Arrangement.spacedBy(4.dp),
@@ -1003,69 +1068,119 @@ private fun ProtectedMessageMediaPreview(
 }
 
 @Composable
-private fun MessageActionAndReactionSheet(
+internal fun MessageActionAndReactionSheet(
     message: ChatMessage,
     isOwnMessage: Boolean,
     onSelectReaction: (String) -> Unit,
     onOpenCustomEmoji: () -> Unit,
     onReply: () -> Unit,
-    onEdit: () -> Unit
+    onEdit: () -> Unit,
+    onDeleteForMe: () -> Unit,
+    onDeleteForEveryone: () -> Unit
 ) {
+    val isSaved = message.id.isNotBlank() && !message.id.startsWith("local_")
+    val canDeleteForEveryone = isSaved && isOwnMessage && !message.isDeleted
+
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 20.dp, vertical = 12.dp),
-        verticalArrangement = Arrangement.spacedBy(14.dp)
+            .padding(horizontal = 20.dp, vertical = 12.dp)
+            .testTag("message_action_menu"),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            WatermarkCursorUtils.COMMON_REACTIONS.forEach { emoji ->
-                Surface(
-                    shape = CircleShape,
-                    color = MaterialTheme.colorScheme.surfaceVariant,
-                    modifier = Modifier
-                        .size(42.dp)
-                        .clickable { onSelectReaction(emoji) }
+        if (isSaved && !message.isDeleted) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                WatermarkCursorUtils.COMMON_REACTIONS.forEach { emoji ->
+                    Surface(
+                        shape = CircleShape,
+                        color = MaterialTheme.colorScheme.surfaceVariant,
+                        modifier = Modifier
+                            .size(42.dp)
+                            .clickable { onSelectReaction(emoji) }
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Text(text = emoji, style = MaterialTheme.typography.titleLarge)
+                        }
+                    }
+                }
+                IconButton(onClick = onOpenCustomEmoji) {
+                    Icon(
+                        imageVector = Icons.Outlined.EmojiEmotions,
+                        contentDescription = "Custom Emoji"
+                    )
+                }
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                OutlinedButton(
+                    onClick = onReply,
+                    modifier = Modifier.weight(1f)
                 ) {
-                    Box(contentAlignment = Alignment.Center) {
-                        Text(text = emoji, style = MaterialTheme.typography.titleLarge)
+                    Icon(Icons.AutoMirrored.Filled.Reply, contentDescription = null)
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("Reply")
+                }
+                if (isOwnMessage && message.kind == MessageKind.TEXT) {
+                    OutlinedButton(
+                        onClick = onEdit,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Icon(Icons.Default.Edit, contentDescription = null)
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Edit Message")
                     }
                 }
             }
-            IconButton(onClick = onOpenCustomEmoji) {
-                Icon(
-                    imageVector = Icons.Outlined.EmojiEmotions,
-                    contentDescription = "Custom Emoji"
-                )
-            }
         }
 
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(10.dp)
-        ) {
-            OutlinedButton(
-                onClick = onReply,
-                modifier = Modifier.weight(1f)
+        if (isSaved) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                Icon(Icons.AutoMirrored.Filled.Reply, contentDescription = null)
-                Spacer(modifier = Modifier.width(6.dp))
-                Text("Reply")
-            }
-            if (isOwnMessage && message.kind == MessageKind.TEXT) {
                 OutlinedButton(
-                    onClick = onEdit,
-                    modifier = Modifier.weight(1f)
+                    onClick = onDeleteForMe,
+                    modifier = Modifier
+                        .weight(1f)
+                        .testTag("action_delete_for_me")
                 ) {
-                    Icon(Icons.Default.Edit, contentDescription = null)
+                    Icon(
+                        imageVector = Icons.Default.VisibilityOff,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp)
+                    )
                     Spacer(modifier = Modifier.width(6.dp))
-                    Text("Edit Message")
+                    Text("Delete for me")
+                }
+
+                if (canDeleteForEveryone) {
+                    Button(
+                        onClick = onDeleteForEveryone,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = CoralHangup
+                        ),
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("action_delete_for_everyone")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.DeleteForever,
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Delete for everyone")
+                    }
                 }
             }
         }
-        Spacer(modifier = Modifier.height(12.dp))
+        Spacer(modifier = Modifier.height(10.dp))
     }
 }

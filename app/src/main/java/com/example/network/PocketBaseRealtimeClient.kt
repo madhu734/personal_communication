@@ -40,7 +40,8 @@ data class RealtimeRecordEvent(
  * 4. Emits record create/update/delete events and triggers catch-up on reconnect.
  */
 class PocketBaseRealtimeClient(
-    private val sessionStore: SessionAndMuteStore
+    private val sessionStore: SessionAndMuteStore,
+    private val enableNetworkSse: Boolean = true
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val sseHttpClient = OkHttpClient.Builder()
@@ -63,6 +64,15 @@ class PocketBaseRealtimeClient(
     private val _onReconnected = MutableSharedFlow<Unit>(extraBufferCapacity = 8)
     val onReconnected: SharedFlow<Unit> = _onReconnected.asSharedFlow()
 
+    internal suspend fun emitEventForTest(event: RealtimeRecordEvent) {
+        _events.emit(event)
+    }
+
+    internal suspend fun emitReconnectForTest() {
+        _isConnected.value = true
+        _onReconnected.emit(Unit)
+    }
+
     fun connectIfAuthenticated() {
         val token = sessionStore.getAuthToken()
         if (token.isBlank()) {
@@ -70,6 +80,7 @@ class PocketBaseRealtimeClient(
             return
         }
         shouldStayConnected = true
+        if (!enableNetworkSse) return
         if (activeEventSource != null) return
         openEventSource()
     }
@@ -191,6 +202,7 @@ class PocketBaseRealtimeClient(
             "conversation_members/*",
             "message_requests/*",
             "messages/*",
+            "message_hides/*",
             "message_reactions/*",
             "calls/*"
         )

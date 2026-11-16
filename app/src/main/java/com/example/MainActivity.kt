@@ -268,7 +268,12 @@ fun ApunKaRootContent(
                 Column(modifier = Modifier.fillMaxSize()) {
                     FeedbackBannerOverlay(
                         uiState = uiState,
-                        onDismiss = { viewModel.clearBannerAndError() }
+                        onDismiss = { viewModel.clearBannerAndError() },
+                        onRetry = if (uiState.retryableAction != null) {
+                            { viewModel.retryLastFailedAction() }
+                        } else {
+                            null
+                        }
                     )
                     if (callState.phase != CallPhase.IDLE && callState.isMinimizedInApp) {
                         InAppMinimizedCallCard(
@@ -376,7 +381,12 @@ fun ApunKaRootContent(
                     ) {
                         FeedbackBannerOverlay(
                             uiState = uiState,
-                            onDismiss = { viewModel.clearBannerAndError() }
+                            onDismiss = { viewModel.clearBannerAndError() },
+                            onRetry = if (uiState.retryableAction != null) {
+                                { viewModel.retryLastFailedAction() }
+                            } else {
+                                null
+                            }
                         )
 
                         if (callState.phase != CallPhase.IDLE && callState.isMinimizedInApp) {
@@ -691,7 +701,8 @@ private fun ActiveTabPane(
 @Composable
 private fun FeedbackBannerOverlay(
     uiState: AppUiState,
-    onDismiss: () -> Unit
+    onDismiss: () -> Unit,
+    onRetry: (() -> Unit)? = null
 ) {
     val msg = uiState.errorMessage ?: uiState.bannerMessage ?: return
     val isError = uiState.errorMessage != null
@@ -714,6 +725,18 @@ private fun FeedbackBannerOverlay(
                 else MaterialTheme.colorScheme.onSecondaryContainer,
                 modifier = Modifier.weight(1f)
             )
+            if (isError && onRetry != null) {
+                TextButton(
+                    onClick = onRetry,
+                    modifier = Modifier.testTag("banner_retry_button")
+                ) {
+                    Text(
+                        text = "Retry",
+                        color = androidx.compose.ui.graphics.Color.White,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
             IconButton(
                 onClick = onDismiss,
                 modifier = Modifier.width(32.dp)

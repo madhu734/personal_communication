@@ -69,13 +69,36 @@ data class ChatMessage(
     val inCall: Boolean = false,
     val created: String,
     val updated: String = created,
+    val deletedAt: String = "",
     val deliveryState: MessageDeliveryState = MessageDeliveryState.SENT,
     val localAttachmentUri: String = ""
 ) {
+    val isDeleted: Boolean
+        get() = deletedAt.isNotBlank()
+
     val isEdited: Boolean
-        get() = updated.isNotBlank() && created.isNotBlank() && updated != created &&
+        get() = !isDeleted && updated.isNotBlank() && created.isNotBlank() && updated != created &&
             parsePocketBaseInstantMillis(updated) - parsePocketBaseInstantMillis(created) > 1500L
+
+    fun normalizedForDeletedState(): ChatMessage =
+        if (isDeleted) {
+            copy(
+                text = "",
+                attachment = "",
+                attachmentBytes = 0L,
+                localAttachmentUri = ""
+            )
+        } else {
+            this
+        }
 }
+
+data class MessageHideRecord(
+    val id: String,
+    val message: String,
+    val user: String = "",
+    val conversation: String = ""
+)
 
 data class MessageReaction(
     val id: String,

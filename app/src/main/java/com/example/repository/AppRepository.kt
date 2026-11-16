@@ -56,6 +56,11 @@ enum class TopLevelTab {
     ACCOUNT
 }
 
+sealed class RetryableAction {
+    data class DeleteMessageForMe(val message: ChatMessage) : RetryableAction()
+    data class DeleteMessageForEveryone(val message: ChatMessage) : RetryableAction()
+}
+
 data class AppUiState(
     val isInitialized: Boolean = false,
     val isLoading: Boolean = false,
@@ -83,13 +88,22 @@ data class AppUiState(
     val recordingElapsedSeconds: Int = 0,
     val playingAudioMessageId: String? = null,
     val bannerMessage: String? = null,
-    val errorMessage: String? = null
+    val errorMessage: String? = null,
+    val retryableAction: RetryableAction? = null
 )
 
-class AppViewModel(application: Application) : AndroidViewModel(application) {
-    val sessionStore = SessionAndMuteStore(application)
-    val apiClient = PocketBaseApiClient(sessionStore)
-    val realtimeClient = PocketBaseRealtimeClient(sessionStore)
+class AppViewModel internal constructor(
+    application: Application,
+    val sessionStore: SessionAndMuteStore,
+    val apiClient: PocketBaseApiClient = PocketBaseApiClient(sessionStore),
+    val realtimeClient: PocketBaseRealtimeClient = PocketBaseRealtimeClient(sessionStore),
+    autoInitialize: Boolean = true
+) : AndroidViewModel(application) {
+    constructor(application: Application) : this(
+        application = application,
+        sessionStore = SessionAndMuteStore(application)
+    )
+
     val callCoordinator = SystemNotificationAndFcmManager.getOrCreateCallCoordinator(
         context = application.applicationContext,
         sessionStore = sessionStore,
@@ -125,6 +139,12 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     // Tracks failed outgoing attachment files by clientMessageId for idempotent retry
     private val pendingRetryAttachments = mutableMapOf<String, Pair<File, String>>()
 
+    // Monotonic delete/hide tracking so stale HTTP responses or SSE events never restore deleted content
+    private val deleteStateLock = Any()
+    private val hiddenMessageIds = mutableSetOf<String>()
+    private val deletedMessagesFloor = mutableMapOf<String, ChatMessage>()
+    private val inFlightDeletes = mutableSetOf<String>()
+
     init {
         SystemNotificationAndFcmManager.ensureChannelsCreated(application)
         callCoordinator.peerLookupProvider = { conversationId, peerId ->
@@ -139,8 +159,12 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         observeRealtimeEvents()
-        startPresenceExpiryWatcher()
-        restoreExistingSession()
+        if (autoInitialize) {
+            startPresenceExpiryWatcher()
+            restoreExistingSession()
+        } else {
+            _uiState.update { it.copy(isInitialized = true) }
+        }
     }
 
     private fun observeRealtimeEvents() {
@@ -266,14 +290,17 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         if (lockoutSecs > 0) {
             startPinLockoutCountdownTicker()
         }
-        // Validate active session against GET /api/app/account/session on resume
+        // Validate active session against GET /api/app/account/session and reconcile messages on resume
         viewModelScope.launch {
             try {
                 if (!apiClient.validateCurrentSession()) {
                     performLocalSignOutCleanup("Your session ended on this device. Please sign in again.")
+                    return@launch
                 }
             } catch (_: Exception) {
             }
+            realtimeClient.connectIfAuthenticated()
+            reconcileAuthenticatedDataInternal()
         }
     }
 
@@ -741,6 +768,11 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
         pendingRetryAttachments.clear()
+        synchronized(deleteStateLock) {
+            hiddenMessageIds.clear()
+            deletedMessagesFloor.clear()
+            inFlightDeletes.clear()
+        }
         _uiState.update {
             AppUiState(
                 isInitialized = true,
@@ -826,9 +858,15 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     // ---------------- Non-Blocking Parallel Data Sync & Watermarks ----------------
 
     fun refreshAllAuthenticatedData() {
-        val ownUser = _uiState.value.currentUser ?: return
         viewModelScope.launch {
-            try {
+            reconcileAuthenticatedDataInternal()
+        }
+    }
+
+    internal suspend fun reconcileAuthenticatedDataInternal() {
+        val ownUser = _uiState.value.currentUser ?: return
+        try {
+            val (sessionValid, inbox, allMembers, serverHides) = coroutineScope {
                 val sessionValidDeferred = async(Dispatchers.IO) {
                     try {
                         apiClient.validateCurrentSession()
@@ -844,27 +882,62 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                         emptyList()
                     }
                 }
-
-                if (!sessionValidDeferred.await()) {
-                    performLocalSignOutCleanup("Your session ended on this device. Please sign in again.")
-                    return@launch
+                val hidesDeferred = async(Dispatchers.IO) {
+                    try {
+                        apiClient.fetchMessageHides(perPage = 500)
+                    } catch (_: Exception) {
+                        null
+                    }
                 }
-
-                val inbox = inboxDeferred.await()
-                val allMembers = membersDeferred.await()
-                val membersMap = allMembers.groupBy { it.conversation }
-
-                // Show inbox list immediately so UI never feels frozen
-                _uiState.update {
-                    it.copy(
-                        chats = inbox.chats,
-                        requests = inbox.requests,
-                        membersByConversation = membersMap
+                listOf(
+                    sessionValidDeferred.await(),
+                    inboxDeferred.await(),
+                    membersDeferred.await(),
+                    hidesDeferred.await()
+                ).let {
+                    @Suppress("UNCHECKED_CAST")
+                    Quadruple(
+                        it[0] as Boolean,
+                        it[1] as com.example.network.InboxPayload,
+                        it[2] as List<ConversationMemberRecord>,
+                        it[3] as List<com.example.model.MessageHideRecord>?
                     )
                 }
-                recomputeChatsSummary()
+            }
 
-                // Fetch existing chat history and recent calls normally after sign-in
+            if (!sessionValid) {
+                performLocalSignOutCleanup("Your session ended on this device. Please sign in again.")
+                return
+            }
+
+            if (serverHides != null) {
+                synchronized(deleteStateLock) {
+                    serverHides.forEach { hide ->
+                        if (hide.message.isNotBlank() && (hide.user.isBlank() || hide.user == ownUser.id)) {
+                            hiddenMessageIds.add(hide.message)
+                        }
+                    }
+                }
+            }
+
+            val membersMap = allMembers.groupBy { it.conversation }
+
+            // Show inbox list immediately so UI never feels frozen
+            _uiState.update {
+                it.copy(
+                    chats = inbox.chats,
+                    requests = inbox.requests,
+                    membersByConversation = membersMap
+                )
+            }
+            recomputeChatsSummary()
+
+            val selectedConvId = _uiState.value.selectedConversationId
+            val inCallConvId = callCoordinator.uiState.value.conversationId
+                .takeIf { it.isNotBlank() && callCoordinator.uiState.value.phase != com.example.model.CallPhase.IDLE }
+            val activeReactionsTargetIds = setOfNotNull(selectedConvId, inCallConvId)
+
+            val (calls, fetchedReactions, fetchedByChat) = coroutineScope {
                 val callsDeferred = async(Dispatchers.IO) {
                     try {
                         apiClient.fetchRecentCalls()
@@ -872,105 +945,221 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                         emptyList()
                     }
                 }
-
-                val fetchedByChat = coroutineScope {
-                    inbox.chats.map { chat ->
-                        async(Dispatchers.IO) {
-                            try {
-                                val msgs = apiClient.fetchMessages(conversationId = chat.id, perPage = 30)
-                                acknowledgeSyncedPeerMessages(
-                                    conversationId = chat.id,
-                                    messages = msgs,
-                                    ownUserId = ownUser.id,
-                                    ownMember = membersMap[chat.id]?.firstOrNull { it.user == ownUser.id }
-                                )
-                                chat.id to msgs
-                            } catch (_: Exception) {
-                                null
-                            }
+                val reactionsDeferredMap = activeReactionsTargetIds.associateWith { convId ->
+                    async(Dispatchers.IO) {
+                        try {
+                            apiClient.fetchMessageReactions(conversationId = convId)
+                        } catch (_: Exception) {
+                            null
                         }
-                    }.awaitAll().filterNotNull()
+                    }
                 }
-
-                val updatedMessagesMap = _uiState.value.messagesByConversation.toMutableMap()
-                for ((chatId, serverMsgs) in fetchedByChat) {
-                    val existingFailed = updatedMessagesMap[chatId]
-                        ?.filter {
-                            it.deliveryState == MessageDeliveryState.FAILED ||
-                                it.deliveryState == MessageDeliveryState.SENDING
+                val messagesDeferredList = inbox.chats.map { chat ->
+                    async(Dispatchers.IO) {
+                        try {
+                            val currentServerCount = _uiState.value.messagesByConversation[chat.id]
+                                ?.count { !it.id.startsWith("local_") } ?: 0
+                            val targetPerPage = maxOf(30, currentServerCount + 10).coerceAtMost(200)
+                            val rawMsgs = apiClient.fetchMessages(conversationId = chat.id, perPage = targetPerPage)
+                            val filteredMsgs = applyMonotonicDeleteRules(rawMsgs)
+                            acknowledgeSyncedPeerMessages(
+                                conversationId = chat.id,
+                                messages = filteredMsgs,
+                                ownUserId = ownUser.id,
+                                ownMember = membersMap[chat.id]?.firstOrNull { it.user == ownUser.id }
+                            )
+                            chat.id to filteredMsgs
+                        } catch (_: Exception) {
+                            null
                         }
-                        .orEmpty()
-                    updatedMessagesMap[chatId] = mergeMessagesWithLocalQueue(
-                        serverMessages = serverMsgs,
-                        localQueue = existingFailed,
-                        ownUserId = ownUser.id,
-                        peerMember = membersMap[chatId]?.firstOrNull { it.user != ownUser.id }
-                    )
+                    }
                 }
-
-                val calls = callsDeferred.await()
-                _uiState.update {
-                    it.copy(
-                        recentCalls = calls,
-                        messagesByConversation = updatedMessagesMap
-                    )
-                }
-                recomputeChatsSummary()
-            } catch (e: Exception) {
-                handleApiFailure(e, "Could not sync inbox.")
+                val resolvedReactions = reactionsDeferredMap.mapValues { it.value.await() }
+                Triple(
+                    callsDeferred.await(),
+                    resolvedReactions,
+                    messagesDeferredList.awaitAll().filterNotNull()
+                )
             }
+
+            val updatedMessagesMap = _uiState.value.messagesByConversation.toMutableMap()
+            val updatedReactionsMap = _uiState.value.reactionsByConversation.toMutableMap()
+
+            for ((convId, fetchedReacts) in fetchedReactions) {
+                if (fetchedReacts != null) {
+                    updatedReactionsMap[convId] = fetchedReacts
+                }
+            }
+
+            for ((chatId, serverMsgs) in fetchedByChat) {
+                val existingList = updatedMessagesMap[chatId].orEmpty()
+                val existingFailed = existingList.filter {
+                    it.deliveryState == MessageDeliveryState.FAILED ||
+                        it.deliveryState == MessageDeliveryState.SENDING
+                }
+                val merged = mergeMessagesWithLocalQueue(
+                    serverMessages = applyMonotonicDeleteRules(serverMsgs),
+                    localQueue = existingFailed,
+                    ownUserId = ownUser.id,
+                    peerMember = membersMap[chatId]?.firstOrNull { it.user != ownUser.id }
+                )
+                updatedMessagesMap[chatId] = merged
+                merged.filter { it.isDeleted }.forEach { delMsg ->
+                    clearCachedMediaForMessage(delMsg.id)
+                    SystemNotificationAndFcmManager.removeMessageFromNotifications(
+                        getApplication(),
+                        chatId,
+                        delMsg.id
+                    )
+                }
+            }
+
+            val hiddenSnapshot: Set<String>
+            val deletedSnapshot: Set<String>
+            synchronized(deleteStateLock) {
+                hiddenSnapshot = hiddenMessageIds.toSet()
+                deletedSnapshot = deletedMessagesFloor.keys.toSet()
+            }
+            hiddenSnapshot.forEach { hiddenId ->
+                clearCachedMediaForMessage(hiddenId)
+            }
+            updatedReactionsMap.keys.toList().forEach { convId ->
+                val list = updatedReactionsMap[convId].orEmpty()
+                updatedReactionsMap[convId] = list.filterNot {
+                    it.message in hiddenSnapshot || it.message in deletedSnapshot
+                }
+            }
+            _uiState.update { state ->
+                val clearReply = state.replyTargetMessage?.id?.let {
+                    it in hiddenSnapshot || it in deletedSnapshot
+                } == true
+                val clearEdit = state.editingMessage?.id?.let {
+                    it in hiddenSnapshot || it in deletedSnapshot
+                } == true
+                state.copy(
+                    recentCalls = calls,
+                    messagesByConversation = updatedMessagesMap,
+                    reactionsByConversation = updatedReactionsMap,
+                    replyTargetMessage = if (clearReply) null else state.replyTargetMessage,
+                    editingMessage = if (clearEdit) null else state.editingMessage
+                )
+            }
+            recomputeChatsSummary()
+        } catch (e: Exception) {
+            handleApiFailure(e, "Could not sync inbox.")
         }
     }
 
     fun refreshConversationData(conversationId: String) {
         if (conversationId.isBlank()) return
-        val ownUser = _uiState.value.currentUser ?: return
         viewModelScope.launch {
-            try {
-                val (msgs, members, reactions) = coroutineScope {
-                    val mDef = async(Dispatchers.IO) {
-                        apiClient.fetchMessages(conversationId = conversationId, perPage = 30)
+            reconcileConversationDataInternal(conversationId)
+        }
+    }
+
+    internal suspend fun reconcileConversationDataInternal(conversationId: String) {
+        if (conversationId.isBlank()) return
+        val ownUser = _uiState.value.currentUser ?: return
+        try {
+            val currentList = _uiState.value.messagesByConversation[conversationId].orEmpty()
+            val targetPerPage = maxOf(30, currentList.count { !it.id.startsWith("local_") } + 10)
+                .coerceAtMost(200)
+            val (rawMsgs, members, reactions, serverHides) = coroutineScope {
+                val mDef = async(Dispatchers.IO) {
+                    apiClient.fetchMessages(conversationId = conversationId, perPage = targetPerPage)
+                }
+                val memDef = async(Dispatchers.IO) {
+                    apiClient.fetchConversationMembers(conversationId = conversationId)
+                }
+                val rDef = async(Dispatchers.IO) {
+                    apiClient.fetchMessageReactions(conversationId = conversationId)
+                }
+                val hDef = async(Dispatchers.IO) {
+                    try {
+                        apiClient.fetchMessageHides(perPage = 500)
+                    } catch (_: Exception) {
+                        null
                     }
-                    val memDef = async(Dispatchers.IO) {
-                        apiClient.fetchConversationMembers(conversationId = conversationId)
-                    }
-                    val rDef = async(Dispatchers.IO) {
-                        apiClient.fetchMessageReactions(conversationId = conversationId)
-                    }
-                    Triple(mDef.await(), memDef.await(), rDef.await())
                 }
-
-                val peerMember = members.firstOrNull { it.user != ownUser.id }
-                val ownMember = members.firstOrNull { it.user == ownUser.id }
-
-                val currentList = _uiState.value.messagesByConversation[conversationId].orEmpty()
-                val localPending = currentList.filter {
-                    it.deliveryState == MessageDeliveryState.FAILED ||
-                        it.deliveryState == MessageDeliveryState.SENDING
-                }
-                val merged = mergeMessagesWithLocalQueue(msgs, localPending, ownUser.id, peerMember)
-
-                _uiState.update { state ->
-                    state.copy(
-                        messagesByConversation = state.messagesByConversation + (conversationId to merged),
-                        membersByConversation = state.membersByConversation + (conversationId to members),
-                        reactionsByConversation = state.reactionsByConversation + (conversationId to reactions)
-                    )
-                }
-
-                acknowledgeSyncedPeerMessages(
-                    conversationId = conversationId,
-                    messages = msgs,
-                    ownUserId = ownUser.id,
-                    ownMember = ownMember
-                )
-                if (_uiState.value.selectedConversationId == conversationId) {
-                    markOpenConversationReadIfNeeded(conversationId, merged)
-                }
-                recomputeChatsSummary()
-            } catch (e: Exception) {
-                handleApiFailure(e, "Failed to refresh conversation.")
+                Quadruple(mDef.await(), memDef.await(), rDef.await(), hDef.await())
             }
+
+            if (serverHides != null) {
+                synchronized(deleteStateLock) {
+                    serverHides.forEach { hide ->
+                        if (hide.message.isNotBlank() && (hide.user.isBlank() || hide.user == ownUser.id)) {
+                            hiddenMessageIds.add(hide.message)
+                        }
+                    }
+                }
+            }
+
+            val msgs = applyMonotonicDeleteRules(rawMsgs)
+            msgs.filter { it.isDeleted }.forEach { delMsg ->
+                clearCachedMediaForMessage(delMsg.id)
+                SystemNotificationAndFcmManager.removeMessageFromNotifications(
+                    getApplication(),
+                    conversationId,
+                    delMsg.id
+                )
+            }
+
+            val peerMember = members.firstOrNull { it.user != ownUser.id }
+            val ownMember = members.firstOrNull { it.user == ownUser.id }
+
+            val latestList = _uiState.value.messagesByConversation[conversationId].orEmpty()
+            val localPending = latestList.filter {
+                it.deliveryState == MessageDeliveryState.FAILED ||
+                    it.deliveryState == MessageDeliveryState.SENDING
+            }
+            val merged = mergeMessagesWithLocalQueue(msgs, localPending, ownUser.id, peerMember)
+
+            val hiddenSnapshot: Set<String>
+            val deletedSnapshot: Set<String>
+            synchronized(deleteStateLock) {
+                hiddenSnapshot = hiddenMessageIds.toSet()
+                deletedSnapshot = deletedMessagesFloor.keys.toSet()
+            }
+            hiddenSnapshot.forEach { hiddenId ->
+                clearCachedMediaForMessage(hiddenId)
+                SystemNotificationAndFcmManager.removeMessageFromNotifications(
+                    getApplication(),
+                    conversationId,
+                    hiddenId
+                )
+            }
+            val filteredReactions = reactions.filterNot {
+                it.message in hiddenSnapshot || it.message in deletedSnapshot
+            }
+
+            _uiState.update { state ->
+                val clearReply = state.replyTargetMessage?.id?.let {
+                    it in hiddenSnapshot || it in deletedSnapshot
+                } == true
+                val clearEdit = state.editingMessage?.id?.let {
+                    it in hiddenSnapshot || it in deletedSnapshot
+                } == true
+                state.copy(
+                    messagesByConversation = state.messagesByConversation + (conversationId to merged),
+                    membersByConversation = state.membersByConversation + (conversationId to members),
+                    reactionsByConversation = state.reactionsByConversation + (conversationId to filteredReactions),
+                    replyTargetMessage = if (clearReply) null else state.replyTargetMessage,
+                    editingMessage = if (clearEdit) null else state.editingMessage
+                )
+            }
+
+            acknowledgeSyncedPeerMessages(
+                conversationId = conversationId,
+                messages = msgs,
+                ownUserId = ownUser.id,
+                ownMember = ownMember
+            )
+            if (_uiState.value.selectedConversationId == conversationId) {
+                markOpenConversationReadIfNeeded(conversationId, merged)
+            }
+            recomputeChatsSummary()
+        } catch (e: Exception) {
+            handleApiFailure(e, "Failed to refresh conversation.")
         }
     }
 
@@ -980,11 +1169,13 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         val ownUser = _uiState.value.currentUser ?: return
         viewModelScope.launch {
             try {
-                val older = apiClient.fetchMessages(
-                    conversationId = conversationId,
-                    perPage = 30,
-                    beforeCreated = oldestServer.created,
-                    beforeId = oldestServer.id
+                val older = applyMonotonicDeleteRules(
+                    apiClient.fetchMessages(
+                        conversationId = conversationId,
+                        perPage = 30,
+                        beforeCreated = oldestServer.created,
+                        beforeId = oldestServer.id
+                    )
                 )
                 if (older.isEmpty()) return@launch
                 val peerMember = _uiState.value.membersByConversation[conversationId]
@@ -993,7 +1184,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     it.id.ifBlank { it.clientMessageId }
                 }
                 val merged = mergeMessagesWithLocalQueue(
-                    serverMessages = combined.filter { !it.id.startsWith("local_") },
+                    serverMessages = applyMonotonicDeleteRules(combined.filter { !it.id.startsWith("local_") }),
                     localQueue = combined.filter { it.id.startsWith("local_") },
                     ownUserId = ownUser.id,
                     peerMember = peerMember
@@ -1119,6 +1310,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             } else {
                 msgs.count { msg ->
                     msg.sender != ownUserId &&
+                        !msg.isDeleted &&
                         !WatermarkCursorUtils.isMessageAtOrBeforeWatermark(
                             msgCreated = msg.created,
                             msgId = msg.id,
@@ -1150,24 +1342,39 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         val ownUser = _uiState.value.currentUser ?: return
         when (event.collection) {
             "messages" -> {
-                val msg = PocketBaseApiClient.parseChatMessage(event.record)
-                val convId = msg.conversation
-                val currentList = _uiState.value.messagesByConversation[convId].orEmpty()
-                val updated = when (event.action) {
-                    "delete" -> currentList.filterNot { it.id == msg.id }
-                    else -> {
-                        val filtered = currentList.filterNot {
-                            it.id == msg.id ||
-                                (msg.clientMessageId.isNotBlank() && it.clientMessageId == msg.clientMessageId)
-                        }
-                        filtered + msg
+                val parsed = PocketBaseApiClient.parseChatMessage(event.record)
+                val convId = parsed.conversation
+                val isHidden = synchronized(deleteStateLock) {
+                    if (event.action == "delete") {
+                        hiddenMessageIds.add(parsed.id)
+                        true
+                    } else {
+                        parsed.id in hiddenMessageIds
                     }
+                }
+                if (isHidden) {
+                    applyMessageHideLocally(parsed.id, convId)
+                    return
+                }
+                if (parsed.isDeleted) {
+                    applyDeletedForEveryoneLocally(parsed)
+                    return
+                }
+                val resolvedMsg = applyMonotonicDeleteRules(listOf(parsed)).firstOrNull() ?: return
+                if (resolvedMsg.isDeleted) {
+                    applyDeletedForEveryoneLocally(resolvedMsg)
+                    return
+                }
+                val currentList = _uiState.value.messagesByConversation[convId].orEmpty()
+                val filtered = currentList.filterNot {
+                    it.id == resolvedMsg.id ||
+                        (resolvedMsg.clientMessageId.isNotBlank() && it.clientMessageId == resolvedMsg.clientMessageId)
                 }
                 val peerMember = _uiState.value.membersByConversation[convId]
                     ?.firstOrNull { it.user != ownUser.id }
                 val merged = mergeMessagesWithLocalQueue(
-                    serverMessages = updated.filter { !it.id.startsWith("local_") },
-                    localQueue = updated.filter { it.id.startsWith("local_") },
+                    serverMessages = (filtered + resolvedMsg).filter { !it.id.startsWith("local_") },
+                    localQueue = (filtered + resolvedMsg).filter { it.id.startsWith("local_") },
                     ownUserId = ownUser.id,
                     peerMember = peerMember
                 )
@@ -1176,10 +1383,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                         messagesByConversation = state.messagesByConversation + (convId to merged)
                     )
                 }
-                if (msg.sender != ownUser.id) {
+                if (event.action == "create" && resolvedMsg.sender != ownUser.id && !resolvedMsg.isDeleted) {
                     viewModelScope.launch(Dispatchers.IO) {
                         try {
-                            apiClient.markConversationDelivered(convId, msg.id)
+                            apiClient.markConversationDelivered(convId, resolvedMsg.id)
                         } catch (_: Exception) {
                         }
                         if (_uiState.value.selectedConversationId == convId) {
@@ -1192,13 +1399,34 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                                 conversationId = convId,
                                 peerName = peerName,
                                 senderName = peerName,
-                                messageText = msg.text.ifBlank { "[${msg.kind.wireName}]" },
-                                messageId = msg.id
+                                messageText = resolvedMsg.text.ifBlank { "[${resolvedMsg.kind.wireName}]" },
+                                messageId = resolvedMsg.id
                             )
                         }
                     }
                 }
                 recomputeChatsSummary()
+            }
+
+            "message_hides" -> {
+                val hide = PocketBaseApiClient.parseMessageHideRecord(event.record)
+                if (hide.message.isBlank()) return
+                if (hide.user.isNotBlank() && hide.user != ownUser.id) return
+                when (event.action) {
+                    "delete" -> {
+                        synchronized(deleteStateLock) {
+                            hiddenMessageIds.remove(hide.message)
+                        }
+                        if (hide.conversation.isNotBlank()) {
+                            refreshConversationData(hide.conversation)
+                        } else {
+                            refreshAllAuthenticatedData()
+                        }
+                    }
+                    else -> {
+                        applyMessageHideLocally(hide.message, hide.conversation)
+                    }
+                }
             }
 
             "conversation_members" -> {
@@ -1218,6 +1446,11 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
             "message_reactions" -> {
                 val reaction = PocketBaseApiClient.parseMessageReaction(event.record)
+                val suppress = synchronized(deleteStateLock) {
+                    reaction.message in hiddenMessageIds ||
+                        deletedMessagesFloor.containsKey(reaction.message)
+                }
+                if (suppress) return
                 val convId = reaction.conversation
                 val current = _uiState.value.reactionsByConversation[convId].orEmpty()
                 val next = if (event.action == "delete") {
@@ -1542,15 +1775,274 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             try {
                 val updated = apiClient.editMessage(original.id, newText)
-                replaceMessageByClientId(original.conversation, original.clientMessageId, updated)
+                val safeUpdated = applyMonotonicDeleteRules(listOf(updated)).firstOrNull() ?: return@launch
+                replaceMessageByClientId(original.conversation, original.clientMessageId, safeUpdated)
             } catch (e: Exception) {
                 handleApiFailure(e, "Could not edit message.")
             }
         }
     }
 
+    fun deleteMessageForMe(message: ChatMessage) {
+        if (message.id.isBlank() || message.id.startsWith("local_")) return
+        if (_uiState.value.currentUser == null) return
+        synchronized(deleteStateLock) {
+            if (!inFlightDeletes.add("me:${message.id}")) return
+        }
+        viewModelScope.launch {
+            try {
+                apiClient.deleteMessageForMe(message.id)
+                applyMessageHideLocally(
+                    messageId = message.id,
+                    conversationId = message.conversation
+                )
+                clearRetryableErrorIfMatching(message.id)
+            } catch (e: Exception) {
+                if (e is ApiException && (e.statusCode == 401 || e.statusCode == 403)) {
+                    val revoked = apiClient.isSessionTrulyRevoked()
+                    if (revoked) {
+                        performLocalSignOutCleanup("Your session ended on this device. Please sign in again.")
+                        return@launch
+                    }
+                }
+                _uiState.update { state ->
+                    state.copy(
+                        errorMessage = e.message ?: "Could not delete message for you.",
+                        retryableAction = RetryableAction.DeleteMessageForMe(message)
+                    )
+                }
+            } finally {
+                synchronized(deleteStateLock) {
+                    inFlightDeletes.remove("me:${message.id}")
+                }
+            }
+        }
+    }
+
+    fun deleteMessageForEveryone(message: ChatMessage) {
+        if (message.id.isBlank() || message.id.startsWith("local_") || message.isDeleted) return
+        val ownUser = _uiState.value.currentUser ?: return
+        if (message.sender != ownUser.id) return
+        synchronized(deleteStateLock) {
+            if (!inFlightDeletes.add("everyone:${message.id}")) return
+        }
+        viewModelScope.launch {
+            try {
+                val returnedRecord = apiClient.deleteMessageForEveryone(message.id)
+                val normalized = if (returnedRecord.id.isBlank()) {
+                    returnedRecord.copy(
+                        id = message.id,
+                        conversation = message.conversation,
+                        sender = message.sender,
+                        created = message.created
+                    ).normalizedForDeletedState()
+                } else {
+                    returnedRecord.normalizedForDeletedState()
+                }
+                applyDeletedForEveryoneLocally(normalized)
+                clearRetryableErrorIfMatching(message.id)
+            } catch (e: Exception) {
+                if (e is ApiException && (e.statusCode == 401 || e.statusCode == 403)) {
+                    val revoked = apiClient.isSessionTrulyRevoked()
+                    if (revoked) {
+                        performLocalSignOutCleanup("Your session ended on this device. Please sign in again.")
+                        return@launch
+                    }
+                }
+                _uiState.update { state ->
+                    state.copy(
+                        errorMessage = e.message ?: "Could not delete message for everyone.",
+                        retryableAction = RetryableAction.DeleteMessageForEveryone(message)
+                    )
+                }
+            } finally {
+                synchronized(deleteStateLock) {
+                    inFlightDeletes.remove("everyone:${message.id}")
+                }
+            }
+        }
+    }
+
+    fun retryLastFailedAction() {
+        val action = _uiState.value.retryableAction ?: return
+        _uiState.update { it.copy(errorMessage = null, retryableAction = null) }
+        when (action) {
+            is RetryableAction.DeleteMessageForMe -> deleteMessageForMe(action.message)
+            is RetryableAction.DeleteMessageForEveryone -> deleteMessageForEveryone(action.message)
+        }
+    }
+
+    private fun clearRetryableErrorIfMatching(messageId: String) {
+        _uiState.update { state ->
+            val matching = when (val retry = state.retryableAction) {
+                is RetryableAction.DeleteMessageForMe -> retry.message.id == messageId
+                is RetryableAction.DeleteMessageForEveryone -> retry.message.id == messageId
+                null -> false
+            }
+            if (matching) {
+                state.copy(errorMessage = null, retryableAction = null)
+            } else {
+                state
+            }
+        }
+    }
+
+    private fun applyMonotonicDeleteRules(messages: List<ChatMessage>): List<ChatMessage> {
+        synchronized(deleteStateLock) {
+            messages.forEach { msg ->
+                if (msg.isDeleted && msg.id.isNotBlank()) {
+                    deletedMessagesFloor[msg.id] = msg.normalizedForDeletedState()
+                }
+            }
+            return messages
+                .filterNot { it.id in hiddenMessageIds }
+                .map { msg ->
+                    val floor = deletedMessagesFloor[msg.id]
+                    if (floor != null) {
+                        floor.copy(deliveryState = msg.deliveryState).normalizedForDeletedState()
+                    } else {
+                        msg.normalizedForDeletedState()
+                    }
+                }
+        }
+    }
+
+    private fun applyMessageHideLocally(messageId: String, conversationId: String) {
+        if (messageId.isBlank()) return
+        synchronized(deleteStateLock) {
+            hiddenMessageIds.add(messageId)
+        }
+        clearCachedMediaForMessage(messageId)
+
+        val targetConvs = if (conversationId.isNotBlank()) {
+            listOf(conversationId)
+        } else {
+            _uiState.value.messagesByConversation
+                .filterValues { list -> list.any { it.id == messageId } }
+                .keys
+                .toList()
+        }
+
+        targetConvs.forEach { convId ->
+            SystemNotificationAndFcmManager.removeMessageFromNotifications(
+                getApplication(),
+                convId,
+                messageId
+            )
+        }
+
+        _uiState.update { state ->
+            val updatedMsgs = state.messagesByConversation.toMutableMap()
+            val updatedReactions = state.reactionsByConversation.toMutableMap()
+            targetConvs.forEach { convId ->
+                updatedMsgs[convId] = updatedMsgs[convId].orEmpty().filterNot { it.id == messageId }
+                updatedReactions[convId] = updatedReactions[convId].orEmpty().filterNot { it.message == messageId }
+            }
+            state.copy(
+                messagesByConversation = updatedMsgs,
+                reactionsByConversation = updatedReactions,
+                replyTargetMessage = if (state.replyTargetMessage?.id == messageId) null else state.replyTargetMessage,
+                editingMessage = if (state.editingMessage?.id == messageId) null else state.editingMessage
+            )
+        }
+        recomputeChatsSummary()
+    }
+
+    private fun applyDeletedForEveryoneLocally(record: ChatMessage) {
+        if (record.id.isBlank()) return
+        val normalized = record.normalizedForDeletedState()
+        val isHidden = synchronized(deleteStateLock) {
+            if (normalized.id in hiddenMessageIds) {
+                true
+            } else {
+                if (normalized.isDeleted) {
+                    deletedMessagesFloor[normalized.id] = normalized
+                }
+                false
+            }
+        }
+        if (isHidden) {
+            applyMessageHideLocally(normalized.id, normalized.conversation)
+            return
+        }
+
+        if (normalized.isDeleted) {
+            clearCachedMediaForMessage(normalized.id)
+            SystemNotificationAndFcmManager.removeMessageFromNotifications(
+                getApplication(),
+                normalized.conversation,
+                normalized.id
+            )
+        }
+
+        val convId = normalized.conversation
+        val ownUserId = _uiState.value.currentUser?.id.orEmpty()
+        val peerMember = _uiState.value.membersByConversation[convId]
+            ?.firstOrNull { it.user != ownUserId }
+
+        _uiState.update { state ->
+            val existingList = state.messagesByConversation[convId].orEmpty()
+            val existingMatch = existingList.firstOrNull {
+                it.id == normalized.id ||
+                    (normalized.clientMessageId.isNotBlank() && it.clientMessageId == normalized.clientMessageId)
+            }
+            val preserved = normalized.copy(
+                created = normalized.created.ifBlank { existingMatch?.created.orEmpty() },
+                deliveryState = existingMatch?.deliveryState ?: normalized.deliveryState
+            ).normalizedForDeletedState()
+            val updatedList = existingList.filterNot {
+                it.id == normalized.id ||
+                    (normalized.clientMessageId.isNotBlank() && it.clientMessageId == normalized.clientMessageId)
+            } + preserved
+
+            val merged = mergeMessagesWithLocalQueue(
+                serverMessages = applyMonotonicDeleteRules(updatedList.filter { !it.id.startsWith("local_") }),
+                localQueue = updatedList.filter { it.id.startsWith("local_") },
+                ownUserId = ownUserId,
+                peerMember = peerMember
+            )
+
+            val nextReactions = if (normalized.isDeleted) {
+                val filtered = state.reactionsByConversation[convId].orEmpty()
+                    .filterNot { it.message == normalized.id }
+                state.reactionsByConversation + (convId to filtered)
+            } else {
+                state.reactionsByConversation
+            }
+
+            state.copy(
+                messagesByConversation = state.messagesByConversation + (convId to merged),
+                reactionsByConversation = nextReactions,
+                replyTargetMessage = if (normalized.isDeleted && state.replyTargetMessage?.id == normalized.id) null
+                else state.replyTargetMessage,
+                editingMessage = if (normalized.isDeleted && state.editingMessage?.id == normalized.id) null
+                else state.editingMessage
+            )
+        }
+        recomputeChatsSummary()
+    }
+
+    private fun clearCachedMediaForMessage(messageId: String) {
+        if (messageId.isBlank()) return
+        if (_uiState.value.playingAudioMessageId == messageId) {
+            stopAudioPlayback()
+        }
+        try {
+            val cacheDir = getApplication<Application>().cacheDir
+            cacheDir.listFiles()?.forEach { file ->
+                if (file.name.startsWith("media_${messageId}_")) {
+                    file.delete()
+                }
+            }
+        } catch (_: Exception) {
+        }
+    }
+
     fun toggleOrSetReaction(conversationId: String, messageId: String, emoji: String) {
         val ownUser = _uiState.value.currentUser ?: return
+        val targetMsg = _uiState.value.messagesByConversation[conversationId]
+            ?.firstOrNull { it.id == messageId }
+        if (targetMsg?.isDeleted == true) return
         val existingList = _uiState.value.reactionsByConversation[conversationId].orEmpty()
         val ownExisting = existingList.firstOrNull { it.message == messageId && it.user == ownUser.id }
         val targetEmoji = if (ownExisting?.emoji == emoji) "" else emoji
@@ -1840,7 +2332,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun clearBannerAndError() {
-        _uiState.update { it.copy(bannerMessage = null, errorMessage = null) }
+        _uiState.update { it.copy(bannerMessage = null, errorMessage = null, retryableAction = null) }
     }
 
     private suspend fun copyUriToTempFile(uri: Uri, prefix: String): Pair<File, String>? =
@@ -1865,6 +2357,13 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             } ?: return@withContext null
             tempFile to mime
         }
+
+    private data class Quadruple<A, B, C, D>(
+        val first: A,
+        val second: B,
+        val third: C,
+        val fourth: D
+    )
 
     companion object {
         private val MINIMAL_M4A_HEADER = byteArrayOf(

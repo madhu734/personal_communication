@@ -183,6 +183,7 @@ private fun ChatRowCard(
     val snippetText = when {
         chat.peerTyping -> "typing…"
         lastMsg == null -> "Tap to start chatting"
+        lastMsg.isDeleted -> "This message was deleted."
         lastMsg.kind == MessageKind.IMAGE -> "Photo" + (if (lastMsg.text.isNotBlank()) ": ${lastMsg.text}" else "")
         lastMsg.kind == MessageKind.VOICE -> lastMsg.text.ifBlank { "Voice note" }
         lastMsg.kind == MessageKind.VIDEO -> "Video" + (if (lastMsg.text.isNotBlank()) ": ${lastMsg.text}" else "")
@@ -280,7 +281,7 @@ private fun ChatRowCard(
                     Text(
                         text = snippetText,
                         style = MaterialTheme.typography.bodyMedium,
-                        fontStyle = if (chat.peerTyping) FontStyle.Italic else FontStyle.Normal,
+                        fontStyle = if (chat.peerTyping || lastMsg?.isDeleted == true) FontStyle.Italic else FontStyle.Normal,
                         fontWeight = if (chat.peerTyping) FontWeight.SemiBold else FontWeight.Normal,
                         color = if (chat.peerTyping) OnlineGreen
                         else MaterialTheme.colorScheme.onSurfaceVariant,
