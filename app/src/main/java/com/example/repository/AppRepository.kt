@@ -29,6 +29,7 @@ import com.example.network.PocketBaseApiClient
 import com.example.network.PocketBaseRealtimeClient
 import com.example.network.RealtimeRecordEvent
 import com.example.storage.SessionAndMuteStore
+import com.example.storage.PendingMessageStore
 import com.google.firebase.messaging.FirebaseMessaging
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -141,6 +142,7 @@ class AppViewModel internal constructor(
 
     // Tracks failed outgoing attachment files by clientMessageId for idempotent retry
     private val pendingRetryAttachments = mutableMapOf<String, Pair<File, String>>()
+    private val pendingMessageStore by lazy { PendingMessageStore(getApplication()) }
 
     // Monotonic delete/hide tracking so stale HTTP responses or SSE events never restore deleted content
     private val deleteStateLock = Any()
@@ -235,6 +237,7 @@ class AppViewModel internal constructor(
                         pinLockoutSeconds = sessionStore.getPinLockoutRemainingSeconds()
                     )
                 }
+                restorePendingMessages(existingUser.id)
                 if (_uiState.value.pinLockoutSeconds > 0) {
                     startPinLockoutCountdownTicker()
                 }
@@ -540,6 +543,7 @@ class AppViewModel internal constructor(
                         bannerMessage = null
                     )
                 }
+                restorePendingMessages(auth.user.id)
                 realtimeClient.connectIfAuthenticated()
                 registerFcmTokenIfNeeded()
                 refreshAllAuthenticatedData()
@@ -580,6 +584,7 @@ class AppViewModel internal constructor(
                         needsBackupPinSetup = sessionStore.isBiometricAppLockEnabled && !sessionStore.hasBackupPin()
                     )
                 }
+                restorePendingMessages(auth.user.id)
                 realtimeClient.connectIfAuthenticated()
                 registerFcmTokenIfNeeded()
                 refreshAllAuthenticatedData()
@@ -764,12 +769,6 @@ class AppViewModel internal constructor(
         SystemNotificationAndFcmManager.cancelAllNotifications(getApplication())
         apiClient.clearCachedFileToken()
         sessionStore.clearAuthSession()
-        pendingRetryAttachments.values.forEach { (file, _) ->
-            try {
-                file.delete()
-            } catch (_: Exception) {
-            }
-        }
         pendingRetryAttachments.clear()
         synchronized(deleteStateLock) {
             hiddenMessageIds.clear()
@@ -1690,6 +1689,24 @@ class AppViewModel internal constructor(
         }
     }
 
+    private fun restorePendingMessages(userId: String) {
+        val items = pendingMessageStore.list(userId)
+        items.forEach { item ->
+            item.attachment?.let { pendingRetryAttachments[item.message.clientMessageId] = it to item.mime }
+        }
+        _uiState.update { state ->
+            val messages = state.messagesByConversation.toMutableMap()
+            items.forEach { item ->
+                val conversation = item.message.conversation
+                val existing = messages[conversation].orEmpty()
+                if (existing.none { it.clientMessageId == item.message.clientMessageId }) {
+                    messages[conversation] = existing + item.message
+                }
+            }
+            state.copy(messagesByConversation = messages)
+        }
+    }
+
     fun retryFailedMessage(message: ChatMessage) {
         val filePair = pendingRetryAttachments[message.clientMessageId]
         enqueueAndSendMessage(
@@ -1718,9 +1735,6 @@ class AppViewModel internal constructor(
     ) {
         val ownUser = _uiState.value.currentUser ?: return
         val clientMsgId = existingClientMessageId ?: UUID.randomUUID().toString()
-        if (attachmentFile != null) {
-            pendingRetryAttachments[clientMsgId] = attachmentFile to attachmentMimeType
-        }
         val nowIso = Instant.now().toString()
         val optimistic = ChatMessage(
             id = "local_$clientMsgId",
@@ -1738,6 +1752,14 @@ class AppViewModel internal constructor(
             deliveryState = MessageDeliveryState.SENDING,
             localAttachmentUri = localUriString.ifBlank { attachmentFile?.absolutePath.orEmpty() }
         )
+
+        val pending = try {
+            pendingMessageStore.save(ownUser.id, optimistic, attachmentFile, attachmentMimeType)
+        } catch (e: Exception) {
+            _uiState.update { it.copy(errorMessage = "Could not save the message for retry.") }
+            return
+        }
+        pending.attachment?.let { pendingRetryAttachments[clientMsgId] = it to pending.mime }
 
         val currentMsgs = _uiState.value.messagesByConversation[conversationId].orEmpty()
             .filterNot { it.clientMessageId == clientMsgId }
@@ -1757,10 +1779,12 @@ class AppViewModel internal constructor(
                     kind = kind,
                     replyToId = replyToId,
                     inCall = inCall,
-                    attachmentFile = attachmentFile,
-                    attachmentMimeType = attachmentMimeType
+                    attachmentFile = pending.attachment,
+                    attachmentMimeType = pending.mime
                 )
-                pendingRetryAttachments.remove(clientMsgId)?.first?.delete()
+                pendingMessageStore.remove(ownUser.id, clientMsgId)
+                pendingRetryAttachments.remove(clientMsgId)
+                if (attachmentFile != null && attachmentFile != pending.attachment) attachmentFile.delete()
                 replaceMessageByClientId(
                     conversationId = conversationId,
                     clientMessageId = clientMsgId,
