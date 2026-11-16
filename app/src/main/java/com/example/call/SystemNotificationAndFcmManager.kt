@@ -909,7 +909,8 @@ class CallForegroundService : Service() {
                 ) {
                     fgsType = fgsType or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
                 }
-                if (androidx.core.content.ContextCompat.checkSelfPermission(
+                if (intent?.getBooleanExtra("is_video", false) == true &&
+                    androidx.core.content.ContextCompat.checkSelfPermission(
                         applicationContext,
                         android.Manifest.permission.CAMERA
                     ) == android.content.pm.PackageManager.PERMISSION_GRANTED
