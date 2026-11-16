@@ -189,13 +189,17 @@ class MainActivity : FragmentActivity() {
     }
 
     private fun updatePipParams(): PictureInPictureParams? {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return null
         val callState = viewModel.callCoordinator.uiState.value
         val eligible = callState.phase == CallPhase.ACTIVE &&
             (callState.kind == CallKind.VIDEO || callState.isCameraEnabled)
         val builder = PictureInPictureParams.Builder()
             .setAspectRatio(Rational(16, 9))
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val sourceBounds = android.graphics.Rect()
+            window.decorView.getGlobalVisibleRect(sourceBounds)
+            if (!sourceBounds.isEmpty) {
+                builder.setSourceRectHint(sourceBounds)
+            }
             builder.setAutoEnterEnabled(eligible)
         }
         val params = builder.build()
@@ -207,7 +211,6 @@ class MainActivity : FragmentActivity() {
     }
 
     private fun enterOsPipIfEligible() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
         if (!packageManager.hasSystemFeature(PackageManager.FEATURE_PICTURE_IN_PICTURE)) return
         val params = updatePipParams() ?: return
         try {

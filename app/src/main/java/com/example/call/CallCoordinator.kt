@@ -1,6 +1,7 @@
 package com.example.call
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.content.Context
 import android.content.pm.PackageManager
 import android.media.AudioAttributes
@@ -998,6 +999,7 @@ class CallCoordinator(
         }
     }
 
+    @SuppressLint("SwitchIntDef")
     private fun querySystemAudioEndpoints(): List<AudioEndpointItem> {
         val endpoints = mutableListOf(
             AudioEndpointItem("earpiece", AudioEndpointType.EARPIECE, "Phone Earpiece"),

@@ -68,6 +68,15 @@ android {
     includeInApk = false
     includeInBundle = true
   }
+  packaging {
+    jniLibs {
+      keepDebugSymbols += setOf(
+        "**/libandroidx.graphics.path.so",
+        "**/libdatastore_shared_counter.so",
+        "**/liblkjingle_peerconnection_so.so"
+      )
+    }
+  }
 }
 
 // Configure the Secrets Gradle Plugin to use .env and .env.example files

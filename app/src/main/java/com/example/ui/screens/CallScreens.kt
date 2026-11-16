@@ -32,7 +32,9 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Chat
+import androidx.compose.material.icons.automirrored.filled.ScreenShare
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.automirrored.filled.StopScreenShare
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.BluetoothAudio
 import androidx.compose.material.icons.filled.Call
@@ -47,8 +49,6 @@ import androidx.compose.material.icons.filled.MicOff
 import androidx.compose.material.icons.filled.Minimize
 import androidx.compose.material.icons.filled.PhoneInTalk
 import androidx.compose.material.icons.filled.PictureInPictureAlt
-import androidx.compose.material.icons.filled.ScreenShare
-import androidx.compose.material.icons.filled.StopScreenShare
 import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material.icons.filled.VideocamOff
 import androidx.compose.material3.Card
@@ -783,8 +783,8 @@ private fun ActiveCallControlDock(
             )
 
             RoundCallControlButton(
-                icon = if (callState.isScreenSharing) Icons.Default.StopScreenShare
-                else Icons.Default.ScreenShare,
+                icon = if (callState.isScreenSharing) Icons.AutoMirrored.Filled.StopScreenShare
+                else Icons.AutoMirrored.Filled.ScreenShare,
                 contentDescription = if (callState.isScreenSharing) "Stop Screen Share" else "Share Screen",
                 backgroundColor = if (callState.isScreenSharing) EmeraldPrimaryDark
                 else Color.White.copy(alpha = 0.14f),

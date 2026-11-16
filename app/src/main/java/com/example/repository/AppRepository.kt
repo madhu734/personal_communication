@@ -788,6 +788,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    @Suppress("DEPRECATION")
     private fun fetchAndRegisterFirebaseToken(attempt: Int) {
         try {
             FirebaseMessaging.getInstance().token

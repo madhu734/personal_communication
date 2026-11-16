@@ -455,6 +455,7 @@ object SystemNotificationAndFcmManager {
 class ApunKaMessagingService : FirebaseMessagingService() {
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
+    @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
     override fun onNewToken(token: String) {
         super.onNewToken(token)
         val store = SessionAndMuteStore(applicationContext)
@@ -930,11 +931,7 @@ class CallForegroundService : Service() {
                 putExtra("is_video", isVideo)
             }
             try {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    context.startForegroundService(intent)
-                } else {
-                    context.startService(intent)
-                }
+                context.startForegroundService(intent)
             } catch (_: Exception) {
             }
         }
