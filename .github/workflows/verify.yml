@@ -24,12 +24,19 @@ jobs:
       - name: Prepare debug signing
         run: |
           keytool -genkeypair -keystore debug.keystore -storepass android -keypass android -alias androiddebugkey -keyalg RSA -validity 365 -dname 'CN=Android Debug'
-      - name: Compile and run regression tests
-        run: gradle :app:assembleDebug :app:testDebugUnitTest :app:lintDebug --no-daemon --max-workers=2 -Dorg.gradle.jvmargs='-Xmx3g -Dfile.encoding=UTF-8'
+      - name: Build phone-test APK
+        run: gradle :app:assembleDebug -PsideBySideInstall --no-daemon --max-workers=2 -Dorg.gradle.jvmargs='-Xmx3g -Dfile.encoding=UTF-8'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: call-test-apk
+          path: app/build/outputs/apk/debug/*.apk
+      - name: Run regression tests
+        run: gradle :app:testDebugUnitTest --no-daemon --max-workers=2 -Dorg.gradle.jvmargs='-Xmx3g -Dfile.encoding=UTF-8'
+      - name: Run Android lint
+        if: always()
+        run: gradle :app:lintDebug --no-daemon --max-workers=2 -Dorg.gradle.jvmargs='-Xmx3g -Dfile.encoding=UTF-8'
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: android-verification
-          path: |
-            app/build/reports/
-            app/build/outputs/apk/debug/*.apk
+          path: app/build/reports/
